@@ -1,0 +1,9 @@
+[project]
+name = "8beetbebellion-tools"
+version = "0.1.0"
+description = "Local preservation and compatibility tools for a user-owned LP 8-Bit Rebellion IPA"
+requires-python = ">=3.10"
+dependencies = []
+
+[tool.ruff]
+line-length = 100

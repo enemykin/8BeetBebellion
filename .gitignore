@@ -1,0 +1,44 @@
+# User-supplied and proprietary inputs
+/input/
+
+# Local agent instructions
+AGENTS.md
+agents.md
+.agents/
+.codex/
+/docs/FIRST_TASK.md
+
+# Local game saves
+/touchHLE_sandbox/
+
+# Generated reports and logs
+/reports/*
+!/reports/.gitkeep
+*.log
+
+# External source trees and build output
+/vendor/
+/build/
+/target/
+
+# Extracted app bundles and archives
+*.ipa
+*.app/
+*.zip
+*.7z
+*.tar
+*.tar.gz
+*.dSYM/
+
+# Python
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.venv/
+venv/
+
+# OS/editor
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/

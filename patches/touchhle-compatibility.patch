@@ -1,0 +1,5007 @@
+diff --git a/OPTIONS_HELP.txt b/OPTIONS_HELP.txt
+index 9297a5f..c270df9 100644
+--- a/OPTIONS_HELP.txt
++++ b/OPTIONS_HELP.txt
+@@ -22,6 +22,16 @@ View options:
+         and it will automatically rotate the window, but some apps neglect to
+         do this. These options may be useful in that case.
+ 
++    --landscape-content-layout
++        Use landscape bounds for UIKit and EAGL content, without rotating the
++        view controller again. Also correct a portrait-sized orthographic
++        projection when the app uses a landscape OpenGL viewport.
++
++    --tolerate-nil-dictionary-keys
++        In an opted-in compatibility run, ignore NSMutableDictionary
++        insertions whose key is nil and log each occurrence. Foundation
++        normally raises an exception for these calls.
++
+     --scale-hack=...
+         Set a scaling factor for the window. touchHLE will attempt to run the
+         app with an increased internal resolution. This is a hack and there's
+@@ -166,6 +176,14 @@ Game controller options:
+         right analog stick (tap/hold by pressing the stick or right shoulder
+         button).
+ 
++    --keyboard-game-controls
++        Maps physical A/Left and D/Right keys to the DPadLeft and DPadRight
++        touch points, Space to the A touch point, W/Up to the visible door
++        action, and Escape to the side menu in 8-Bit Rebellion 1.4.5.
++        Configure the three fixed touch points with --button-to-touch.
++        Physical letter keys work with different keyboard layouts.
++        Off by default.
++
+     --stabilize-virtual-cursor=...
+         Apply motion smoothing and a sticky radius to the virtual cursor
+         (controlled by the right analog stick).
+diff --git a/src/dyld.rs b/src/dyld.rs
+index 71b8d00..b36980f 100644
+--- a/src/dyld.rs
++++ b/src/dyld.rs
+@@ -230,7 +230,8 @@ pub struct Dyld {
+     linked_host_functions: Vec<(&'static str, HostFunction)>,
+     return_to_host_routine: Option<GuestFunction>,
+     thread_exit_routine: Option<GuestFunction>,
+-    constants_to_link_later: Vec<(MutPtr<ConstVoidPtr>, &'static HostConstant)>,
++    constants_to_link_later: Vec<(MutPtr<ConstVoidPtr>, &'static str)>,
++    linked_host_constants: HashMap<&'static str, ConstVoidPtr>,
+     non_lazy_host_functions: HashMap<&'static str, GuestFunction>,
+ }
+ 
+@@ -260,6 +261,7 @@ impl Dyld {
+             return_to_host_routine: None,
+             thread_exit_routine: None,
+             constants_to_link_later: Vec::new(),
++            linked_host_constants: HashMap::new(),
+             non_lazy_host_functions: HashMap::new(),
+         }
+     }
+@@ -585,11 +587,10 @@ impl Dyld {
+                 log_dbg!("{:?}", self.non_lazy_host_functions);
+                 continue;
+             }
+-            if let Some((_, template)) = search_host_dylibs(|dylib| dylib.constant_exports, symbol)
+-            {
++            if let Some(&(symbol, _)) = search_host_dylibs(|dylib| dylib.constant_exports, symbol) {
+                 // Delay linking of constant until we have a `&mut Environment`,
+                 // that makes it much easier to build NSString objects etc.
+-                self.constants_to_link_later.push((ptr_ptr, template));
++                self.constants_to_link_later.push((ptr_ptr, symbol));
+                 continue;
+             }
+ 
+@@ -607,27 +608,35 @@ impl Dyld {
+     /// Do linking that can only be done once there is a full [Environment].
+     /// Not to be confused with lazy linking.
+     pub fn do_late_linking(env: &mut Environment) {
+-        // TODO: do symbols ever appear in __nl_symbol_ptr multiple times?
+-
+         let to_link = std::mem::take(&mut env.dyld.constants_to_link_later);
+-        for (symbol_ptr_ptr, template) in to_link {
+-            let symbol_ptr: ConstVoidPtr = match template {
+-                HostConstant::NSString(static_str) => {
+-                    let string_ptr = ns_string::get_static_str(env, static_str);
+-                    let string_ptr_ptr = env.mem.alloc_and_write(string_ptr);
+-                    string_ptr_ptr.cast().cast_const()
+-                }
+-                HostConstant::NullPtr => {
+-                    let null_ptr: ConstVoidPtr = Ptr::null();
+-                    let null_ptr_ptr = env.mem.alloc_and_write(null_ptr);
+-                    null_ptr_ptr.cast().cast_const()
+-                }
+-                HostConstant::Custom(f) => f(env),
+-            };
++        for (symbol_ptr_ptr, symbol) in to_link {
++            let symbol_ptr = Self::get_constant_address(env, symbol).unwrap();
+             env.mem.write(symbol_ptr_ptr, symbol_ptr.cast());
+         }
+     }
+ 
++    /// Return the address of an exported constant's storage in guest memory.
++    /// Non-lazy relocations and dlsym() must see the same address.
++    pub fn get_constant_address(env: &mut Environment, symbol: &str) -> Option<ConstVoidPtr> {
++        let &(symbol, ref template) = search_host_dylibs(|dylib| dylib.constant_exports, symbol)?;
++        if let Some(&addr) = env.dyld.linked_host_constants.get(symbol) {
++            return Some(addr);
++        }
++        let addr = match template {
++            HostConstant::NSString(static_str) => {
++                let string_ptr = ns_string::get_static_str(env, static_str);
++                env.mem.alloc_and_write(string_ptr).cast().cast_const()
++            }
++            HostConstant::NullPtr => {
++                let null_ptr: ConstVoidPtr = Ptr::null();
++                env.mem.alloc_and_write(null_ptr).cast().cast_const()
++            }
++            HostConstant::Custom(f) => f(env),
++        };
++        env.dyld.linked_host_constants.insert(symbol, addr);
++        Some(addr)
++    }
++
+     /// Return a host function that can be called to handle an SVC instruction
+     /// encountered during CPU emulation. If `None` is returned, the execution
+     /// needs to resume at `svc_pc`.
+diff --git a/src/environment.rs b/src/environment.rs
+index 131c45d..1be9cac 100644
+--- a/src/environment.rs
++++ b/src/environment.rs
+@@ -298,7 +298,7 @@ impl Environment {
+     /// Loads the binary and sets up the emulator.
+     pub fn new(
+         bundle: bundle::Bundle,
+-        fs: fs::Fs,
++        mut fs: fs::Fs,
+         mut options: options::Options,
+         app_args: Vec<String>,
+     ) -> Result<Environment, String> {
+@@ -425,8 +425,14 @@ impl Environment {
+             || bundle
+                 .bundle_identifier()
+                 .starts_with("com.go.starwave.CritterCrunch");
++        let is_8bit_rebellion = bundle.bundle_identifier() == "com.alife.linkinpark";
++        if is_8bit_rebellion && bundle.bundle_version() == "1.4.5" {
++            crate::frameworks::uikit::rebellion_progress::finish_previously_shown_tutorials(
++                &mut fs,
++            );
++        }
+         // We always reset this flag depending on which game is launched.
+-        mem.zero_memory_on_free = !is_spore && !is_critter_crunch;
++        mem.zero_memory_on_free = !is_spore && !is_critter_crunch && !is_8bit_rebellion;
+         if is_spore {
+             log!("Applying game-specific hack for Spore Origins: zeroing memory on alloc instead of free.");
+         }
+@@ -435,6 +441,11 @@ impl Environment {
+             // the game crashes with a null page access error.
+             log!("Applying game-specific hack for Critter Crunch: zeroing memory on alloc instead of free.");
+         }
++        if is_8bit_rebellion {
++            // AvatarComponent::clearNPC reads a list node again after removing
++            // (and freeing) it. Keep the node's links until the next alloc.
++            log!("Applying game-specific memory allocation compatibility for 8-Bit Rebellion.");
++        }
+         let executable = mach_o::MachO::load_from_file(
+             bundle.executable_path(),
+             &fs,
+@@ -1878,6 +1889,12 @@ impl Environment {
+             .mem
+             .alloc_and_write_cstr(self.fs.home_directory().as_str().as_bytes());
+         self.env_vars.insert(b"HOME".to_vec(), home_value_cstr);
++
++        // SQLite checks TMPDIR before falling back to the read-only guest
++        // working directory when it needs a temporary file for a query.
++        let tmp_dir = self.fs.home_directory().join("tmp");
++        let tmp_value_cstr = self.mem.alloc_and_write_cstr(tmp_dir.as_str().as_bytes());
++        self.env_vars.insert(b"TMPDIR".to_vec(), tmp_value_cstr);
+     }
+ 
+     fn get_sorted_bin_indices(&self) -> Result<Vec<usize>, String> {
+diff --git a/src/frameworks/audio_toolbox/extended_audio_file.rs b/src/frameworks/audio_toolbox/extended_audio_file.rs
+index f973abf..d66d00f 100644
+--- a/src/frameworks/audio_toolbox/extended_audio_file.rs
++++ b/src/frameworks/audio_toolbox/extended_audio_file.rs
+@@ -55,6 +55,7 @@ type ExtAudioFileRef = MutPtr<OpaqueExtAudioFile>;
+ type ExtAudioFilePropertyID = u32;
+ const kExtAudioFileProperty_FileDataFormat: ExtAudioFilePropertyID = fourcc(b"ffmt");
+ const kExtAudioFileProperty_ClientDataFormat: ExtAudioFilePropertyID = fourcc(b"cfmt");
++const kExtAudioFileProperty_FileLengthFrames: ExtAudioFilePropertyID = fourcc(b"#frm");
+ 
+ fn ExtAudioFileOpenURL(
+     env: &mut Environment,
+@@ -111,6 +112,32 @@ fn ExtAudioFileGetProperty(
+ ) -> OSStatus {
+     return_if_null!(in_ext_audio_file);
+ 
++    if in_property_id == kExtAudioFileProperty_FileLengthFrames {
++        if env.mem.read(io_property_data_size) != guest_size_of::<i64>() {
++            return kAudioFileBadPropertySizeError;
++        }
++        let guest_audio_file = State::get(&mut env.framework_state)
++            .extended_audio_files
++            .get(&in_ext_audio_file)
++            .unwrap()
++            .guest_audio_file;
++        let audio_file = env
++            .framework_state
++            .audio_toolbox
++            .audio_file
++            .audio_files
++            .get(&guest_audio_file)
++            .unwrap();
++        let packet_count = audio_file.audio_file.packet_count();
++        let frames_per_packet = audio_file.audio_file.audio_description().frames_per_packet;
++        let frames = packet_count
++            .checked_mul(u64::from(frames_per_packet))
++            .unwrap();
++        env.mem
++            .write(out_property_data.cast(), i64::try_from(frames).unwrap());
++        return 0;
++    }
++
+     let audio_file_property_id = match in_property_id {
+         kExtAudioFileProperty_FileDataFormat => kAudioFilePropertyDataFormat,
+         _ => unimplemented!(
+diff --git a/src/frameworks/core_animation/ca_layer.rs b/src/frameworks/core_animation/ca_layer.rs
+index b58cb8c..20ffe7e 100644
+--- a/src/frameworks/core_animation/ca_layer.rs
++++ b/src/frameworks/core_animation/ca_layer.rs
+@@ -68,6 +68,97 @@ pub(super) struct CALayerHostObject {
+ }
+ impl HostObject for CALayerHostObject {}
+ 
++fn landscape_frame_for_portrait_layer(
++    bounds: CGRect,
++    mut frame: CGRect,
++    portrait_width: f32,
++    portrait_height: f32,
++) -> Option<CGRect> {
++    if bounds.size.width != portrait_width
++        || bounds.size.height != portrait_height
++        || frame.origin.x != 0.0
++        || frame.origin.y != 0.0
++    {
++        return None;
++    }
++    frame.size.width = portrait_height;
++    frame.size.height = portrait_width;
++    Some(frame)
++}
++
++/// Keep full-screen layer geometry consistent with a landscape drawable or
++/// bitmap context. The condition is based on layer geometry, not app identity.
++pub(crate) fn fit_fullscreen_layers_to_landscape(env: &mut Environment, mut layer: id) {
++    if !env.options.landscape_content_layout
++        || !matches!(
++            env.window().current_rotation(),
++            crate::window::DeviceOrientation::LandscapeLeft
++                | crate::window::DeviceOrientation::LandscapeRight
++        )
++    {
++        return;
++    }
++
++    let (portrait_width, portrait_height) = env.window().device_family().portrait_size();
++    for _ in 0..16 {
++        if layer == nil {
++            break;
++        }
++        let bounds: CGRect = msg![env; layer bounds];
++        let frame: CGRect = msg![env; layer frame];
++        if let Some(landscape_frame) = landscape_frame_for_portrait_layer(
++            bounds,
++            frame,
++            portrait_width as f32,
++            portrait_height as f32,
++        ) {
++            () = msg![env; layer setFrame:landscape_frame];
++        }
++        layer = msg![env; layer superlayer];
++    }
++}
++
++#[cfg(test)]
++mod landscape_layer_tests {
++    use super::*;
++
++    #[test]
++    fn fits_only_fullscreen_portrait_layers_at_the_origin() {
++        let portrait = CGRect {
++            origin: CGPoint { x: 0.0, y: 0.0 },
++            size: CGSize {
++                width: 320.0,
++                height: 480.0,
++            },
++        };
++        let fitted = landscape_frame_for_portrait_layer(portrait, portrait, 320.0, 480.0)
++            .expect("full-screen portrait layer should fit landscape");
++        let fitted_size = fitted.size;
++        assert_eq!(
++            fitted_size,
++            CGSize {
++                width: 480.0,
++                height: 320.0
++            }
++        );
++
++        let inset = CGRect {
++            origin: CGPoint { x: 10.0, y: 0.0 },
++            ..portrait
++        };
++        assert!(landscape_frame_for_portrait_layer(portrait, inset, 320.0, 480.0).is_none());
++
++        let small = CGRect {
++            size: CGSize {
++                width: 160.0,
++                height: 240.0,
++            },
++            ..portrait
++        };
++        assert!(landscape_frame_for_portrait_layer(small, small, 320.0, 480.0).is_none());
++    }
++}
++
+ impl CALayerHostObject {
+     /// Internal helper method: generate a transformation matrix to transform
+     /// from the superlayer's co-ordinate space (the space that the layer's
+@@ -439,6 +530,8 @@ pub const CLASSES: ClassExports = objc_classes! {
+         return;
+     }
+ 
++    fit_fullscreen_layers_to_landscape(env, this);
++
+     let &mut CALayerHostObject {
+         cg_context,
+         ref mut gles_texture_is_up_to_date,
+diff --git a/src/frameworks/core_animation/composition.rs b/src/frameworks/core_animation/composition.rs
+index 8470613..01f5b38 100644
+--- a/src/frameworks/core_animation/composition.rs
++++ b/src/frameworks/core_animation/composition.rs
+@@ -13,8 +13,9 @@
+ use super::ca_eagl_layer::find_fullscreen_eagl_layer;
+ use super::ca_layer::CALayerHostObject;
+ use crate::frameworks::core_animation::animation;
++use crate::frameworks::core_graphics::cg_affine_transform::CGAffineTransform;
+ use crate::frameworks::core_graphics::cg_color::CGColorHostObject;
+-use crate::frameworks::core_graphics::{cg_bitmap_context, cg_image, CGFloat, CGRect};
++use crate::frameworks::core_graphics::{cg_bitmap_context, cg_image, CGFloat, CGPoint, CGRect};
+ use crate::gles::gles11_raw as gles11; // constants only
+ use crate::gles::gles11_raw::types::*;
+ use crate::gles::present::{present_frame, FpsCounter};
+@@ -23,6 +24,7 @@ use crate::image::Image;
+ use crate::matrix::Matrix;
+ use crate::mem::SafeWrite;
+ use crate::objc::{id, msg, msg_class, nil, ObjC};
++use crate::window::DeviceOrientation;
+ use crate::Environment;
+ use std::time::{Duration, Instant};
+ 
+@@ -56,6 +58,54 @@ unsafe fn load_matrix(gles: &mut dyn GLES, matrix: Matrix<4>) {
+     gles.LoadMatrixf(matrix.columns().as_ptr() as *const _);
+ }
+ 
++/// Present portrait launch artwork in a fixed landscape layout without
++/// resizing its pixels or changing the guest's view geometry.
++fn landscape_launch_image_geometry(
++    bounds: CGRect,
++    position: CGPoint,
++    anchor: CGPoint,
++    transform: CGAffineTransform,
++    portrait_size: (u32, u32),
++    orientation: DeviceOrientation,
++) -> Option<Matrix<4>> {
++    let (width, height) = (portrait_size.0 as f32, portrait_size.1 as f32);
++    if bounds.origin != (CGPoint { x: 0.0, y: 0.0 })
++        || bounds.size.width != width
++        || bounds.size.height != height
++        || position
++            != (CGPoint {
++                x: width / 2.0,
++                y: height / 2.0,
++            })
++        || anchor != (CGPoint { x: 0.5, y: 0.5 })
++        || !transform.is_identity()
++    {
++        return None;
++    }
++    // Map the unit quad directly into landscape screen coordinates. Exact
++    // quarter-turn coefficients avoid rounding at the image edges.
++    let transform = match orientation {
++        DeviceOrientation::LandscapeRight => CGAffineTransform {
++            a: 0.0,
++            b: -width,
++            c: height,
++            d: 0.0,
++            tx: 0.0,
++            ty: width,
++        },
++        DeviceOrientation::LandscapeLeft => CGAffineTransform {
++            a: 0.0,
++            b: width,
++            c: -height,
++            d: 0.0,
++            tx: height,
++            ty: 0.0,
++        },
++        _ => return None,
++    };
++    Some(transform.into())
++}
++
+ /// For use by `NSRunLoop`: call this 60 times per second. Composites the app's
+ /// visible layers (i.e. UI) and presents it to the screen. Does nothing if
+ /// composition isn't in use or it's too soon (the latter check is skipped if
+@@ -139,7 +189,11 @@ pub fn recomposite_if_necessary(env: &mut Environment, force: bool) -> Option<In
+     let fb_height = screen_bounds.size.height as u32 * scale_hack;
+     let present_frame_args = (
+         env.window().viewport(),
+-        env.window().rotation_matrix(),
++        if env.options.landscape_content_layout {
++            crate::matrix::Matrix::identity()
++        } else {
++            env.window().rotation_matrix()
++        },
+         env.window().virtual_cursor_visible_at(),
+     );
+ 
+@@ -423,6 +477,25 @@ unsafe fn composite_layer_recursive(
+         return;
+     }
+ 
++    let launch_image_modelview = if env.options.landscape_content_layout && host_obj.contents != nil
++    {
++        let image = cg_image::borrow_image(&env.objc, host_obj.contents);
++        if env.window().is_launch_image(image) {
++            landscape_launch_image_geometry(
++                host_obj.bounds,
++                host_obj.position,
++                host_obj.anchor_point,
++                host_obj.affine_transform,
++                env.window().device_family().portrait_size(),
++                env.options.initial_orientation,
++            )
++        } else {
++            None
++        }
++    } else {
++        None
++    };
++
+     let window = env.window.as_mut().unwrap();
+     let mut gles = window.make_internal_gl_ctx_current();
+ 
+@@ -440,9 +513,11 @@ unsafe fn composite_layer_recursive(
+         gles.MatrixMode(gles11::MODELVIEW);
+         load_matrix(
+             gles.as_mut(),
+-            Matrix::<4>::from(&Matrix::scale_2d(bounds.size.width, bounds.size.height))
+-                .multiply(&Matrix::translate_3d(bounds.origin.x, bounds.origin.y, 0.0))
+-                .multiply(&cumulative_transform),
++            launch_image_modelview.unwrap_or_else(|| {
++                Matrix::<4>::from(&Matrix::scale_2d(bounds.size.width, bounds.size.height))
++                    .multiply(&Matrix::translate_3d(bounds.origin.x, bounds.origin.y, 0.0))
++                    .multiply(&cumulative_transform)
++            }),
+         );
+ 
+         cumulative_transform
+@@ -611,11 +686,11 @@ unsafe fn composite_layer_recursive(
+         gles.VertexPointer(2, gles11::FLOAT, 0, 0 as *const GLvoid);
+ 
+         gles.EnableClientState(gles11::TEXTURE_COORD_ARRAY);
+-        // Normal images will have top-to-bottom row order, but OpenGL ES
+-        // expects bottom-to-top, so flip the UVs in that case.
++        // CGImage and CGBitmapContext pixels both have top-to-bottom row
++        // order. Presented EAGL pixels retain OpenGL's bottom-to-top order.
+         gles.BindBuffer(
+             gles11::ARRAY_BUFFER,
+-            if host_obj.contents != nil {
++            if host_obj.contents != nil || host_obj.cg_context.is_some() {
+                 misc.basic_square_buffer
+             } else {
+                 misc.flipped_square_buffer
+@@ -729,3 +804,131 @@ unsafe fn upload_rgba8_pixels(gles: &mut dyn GLES, pixels: &[u8], dimensions: (u
+         gles11::LINEAR as _,
+     );
+ }
++
++#[cfg(test)]
++mod launch_image_tests {
++    use super::*;
++    use crate::frameworks::core_graphics::cg_geometry::CGSize;
++
++    fn geometry(size: (u32, u32), orientation: DeviceOrientation) -> Matrix<4> {
++        let (width, height) = (size.0 as f32, size.1 as f32);
++        landscape_launch_image_geometry(
++            CGRect {
++                origin: CGPoint { x: 0.0, y: 0.0 },
++                size: CGSize { width, height },
++            },
++            CGPoint {
++                x: width / 2.0,
++                y: height / 2.0,
++            },
++            CGPoint { x: 0.5, y: 0.5 },
++            CGAffineTransform::make_scale(1.0, 1.0),
++            size,
++            orientation,
++        )
++        .unwrap()
++    }
++
++    #[test]
++    fn launch_artwork_fills_landscape_without_stretching() {
++        for size in [(320, 480), (768, 1024)] {
++            let (width, height) = (size.0 as f32, size.1 as f32);
++            let right = geometry(size, DeviceOrientation::LandscapeRight);
++            let left = geometry(size, DeviceOrientation::LandscapeLeft);
++            for (point, expected_right, expected_left) in [
++                (
++                    [0.0, 0.0, 0.0, 1.0],
++                    [0.0, width, 0.0, 1.0],
++                    [height, 0.0, 0.0, 1.0],
++                ),
++                (
++                    [1.0, 0.0, 0.0, 1.0],
++                    [0.0, 0.0, 0.0, 1.0],
++                    [height, width, 0.0, 1.0],
++                ),
++                (
++                    [0.0, 1.0, 0.0, 1.0],
++                    [height, width, 0.0, 1.0],
++                    [0.0, 0.0, 0.0, 1.0],
++                ),
++                (
++                    [1.0, 1.0, 0.0, 1.0],
++                    [height, 0.0, 0.0, 1.0],
++                    [0.0, width, 0.0, 1.0],
++                ),
++            ] {
++                assert_eq!(right.transform(point), expected_right);
++                assert_eq!(left.transform(point), expected_left);
++            }
++        }
++    }
++
++    #[test]
++    fn preserves_other_layer_geometry() {
++        let bounds = CGRect {
++            origin: CGPoint { x: 0.0, y: 0.0 },
++            size: CGSize {
++                width: 320.0,
++                height: 480.0,
++            },
++        };
++        let position = CGPoint { x: 160.0, y: 240.0 };
++        let anchor = CGPoint { x: 0.5, y: 0.5 };
++        let identity = CGAffineTransform::make_scale(1.0, 1.0);
++        let check = |bounds, position, anchor, transform, orientation| {
++            assert!(landscape_launch_image_geometry(
++                bounds,
++                position,
++                anchor,
++                transform,
++                (320, 480),
++                orientation
++            )
++            .is_none());
++        };
++        check(
++            bounds,
++            position,
++            anchor,
++            identity,
++            DeviceOrientation::Portrait,
++        );
++        check(
++            bounds,
++            CGPoint { x: 161.0, y: 240.0 },
++            anchor,
++            identity,
++            DeviceOrientation::LandscapeRight,
++        );
++        check(
++            bounds,
++            position,
++            CGPoint { x: 0.0, y: 0.0 },
++            identity,
++            DeviceOrientation::LandscapeRight,
++        );
++        check(
++            bounds,
++            position,
++            anchor,
++            CGAffineTransform {
++                tx: 1.0,
++                ..identity
++            },
++            DeviceOrientation::LandscapeRight,
++        );
++        check(
++            CGRect {
++                size: CGSize {
++                    width: 100.0,
++                    height: 100.0,
++                },
++                ..bounds
++            },
++            position,
++            anchor,
++            identity,
++            DeviceOrientation::LandscapeRight,
++        );
++    }
++}
+diff --git a/src/frameworks/core_foundation.rs b/src/frameworks/core_foundation.rs
+index 205be44..17c8281 100644
+--- a/src/frameworks/core_foundation.rs
++++ b/src/frameworks/core_foundation.rs
+@@ -27,6 +27,7 @@ pub mod cf_preferences;
+ pub mod cf_run_loop;
+ pub mod cf_run_loop_timer;
+ pub mod cf_socket;
++pub mod cf_stream;
+ pub mod cf_string;
+ pub mod cf_type;
+ pub mod cf_url;
+@@ -56,6 +57,7 @@ pub const DYLIB: crate::dyld::HostDylib = crate::dyld::HostDylib {
+         cf_dictionary::FUNCTIONS,
+         cf_bundle::FUNCTIONS,
+         cf_socket::FUNCTIONS,
++        cf_stream::FUNCTIONS,
+         cf_data::FUNCTIONS,
+         cf_locale::FUNCTIONS,
+         cf_number::FUNCTIONS,
+diff --git a/src/frameworks/core_foundation/cf_stream.rs b/src/frameworks/core_foundation/cf_stream.rs
+new file mode 100644
+index 0000000..bcf8d19
+--- /dev/null
++++ b/src/frameworks/core_foundation/cf_stream.rs
+@@ -0,0 +1,40 @@
++/*
++ * This Source Code Form is subject to the terms of the Mozilla Public
++ * License, v. 2.0. If a copy of the MPL was not distributed with this
++ * file, You can obtain one at https://mozilla.org/MPL/2.0/.
++ */
++//! `CFStream` socket stream creation.
++
++use super::cf_allocator::CFAllocatorRef;
++use super::cf_string::CFStringRef;
++use super::CFTypeRef;
++use crate::dyld::{export_c_func, FunctionExports};
++use crate::mem::{MutPtr, Ptr};
++use crate::Environment;
++
++fn CFStreamCreatePairWithSocketToHost(
++    env: &mut Environment,
++    _allocator: CFAllocatorRef,
++    _host: CFStringRef,
++    _port: u32,
++    read_stream: MutPtr<CFTypeRef>,
++    write_stream: MutPtr<CFTypeRef>,
++) {
++    // Socket streams are not implemented yet. Report creation failure through
++    // both out parameters so callers can follow their offline/error path.
++    if !read_stream.is_null() {
++        env.mem.write(read_stream, Ptr::null());
++    }
++    if !write_stream.is_null() {
++        env.mem.write(write_stream, Ptr::null());
++    }
++    log!("CFStream socket streams unavailable; returning no streams");
++}
++
++pub const FUNCTIONS: FunctionExports = &[export_c_func!(CFStreamCreatePairWithSocketToHost(
++    _,
++    _,
++    _,
++    _,
++    _
++))];
+diff --git a/src/frameworks/core_graphics/cg_bitmap_context.rs b/src/frameworks/core_graphics/cg_bitmap_context.rs
+index 118e7f6..3ec75ee 100644
+--- a/src/frameworks/core_graphics/cg_bitmap_context.rs
++++ b/src/frameworks/core_graphics/cg_bitmap_context.rs
+@@ -91,6 +91,7 @@ pub fn CGBitmapContextCreate(
+         transform: CGAffineTransformIdentity,
+         blend_mode: kCGBlendModeNormal,
+         text_transform: None,
++        clip_regions: Vec::new(),
+         state_stack: Vec::new(),
+     };
+     let isa = env
+@@ -414,6 +415,7 @@ pub struct CGBitmapContextDrawer<'a> {
+     rgb_fill_color: (CGFloat, CGFloat, CGFloat, CGFloat),
+     blend_mode: CGBlendMode,
+     transform: CGAffineTransform,
++    clip_regions: Vec<(CGRect, CGAffineTransform)>,
+     pixels: &'a mut [u8],
+ }
+ impl CGBitmapContextDrawer<'_> {
+@@ -427,6 +429,7 @@ impl CGBitmapContextDrawer<'_> {
+             rgb_fill_color,
+             transform,
+             blend_mode,
++            ref clip_regions,
+             ..
+         } = objc.borrow(context);
+ 
+@@ -437,6 +440,7 @@ impl CGBitmapContextDrawer<'_> {
+             rgb_fill_color,
+             blend_mode,
+             transform,
++            clip_regions: clip_regions.clone(),
+             pixels,
+         }
+     }
+@@ -473,6 +477,15 @@ impl CGBitmapContextDrawer<'_> {
+         color: (CGFloat, CGFloat, CGFloat, CGFloat),
+         blend: bool,
+     ) {
++        if !point_is_in_clip(
++            CGPoint {
++                x: coords.0 as f32 + 0.5,
++                y: coords.1 as f32 + 0.5,
++            },
++            &self.clip_regions,
++        ) {
++            return;
++        }
+         put_pixel(
+             &self.bitmap_info,
+             self.pixels,
+@@ -528,6 +541,41 @@ impl CGBitmapContextDrawer<'_> {
+     }
+ }
+ 
++fn point_is_in_clip(point: CGPoint, regions: &[(CGRect, CGAffineTransform)]) -> bool {
++    regions.iter().all(|(rect, transform)| {
++        let point = transform.invert().apply_to_point(point);
++        point.x >= rect.origin.x
++            && point.x < rect.origin.x + rect.size.width
++            && point.y >= rect.origin.y
++            && point.y < rect.origin.y + rect.size.height
++    })
++}
++
++#[cfg(test)]
++#[test]
++fn clip_rectangles_intersect_in_device_space() {
++    let rect = CGRect {
++        origin: CGPoint { x: 0.0, y: 0.0 },
++        size: super::CGSize {
++            width: 2.0,
++            height: 2.0,
++        },
++    };
++    let regions = [
++        (rect, CGAffineTransformIdentity),
++        (rect, CGAffineTransform::make_translation(1.0, 1.0)),
++    ];
++    assert!(point_is_in_clip(CGPoint { x: 1.5, y: 1.5 }, &regions));
++    assert!(!point_is_in_clip(CGPoint { x: 0.5, y: 0.5 }, &regions));
++
++    let rotated = [(
++        rect,
++        CGAffineTransform::make_rotation(std::f32::consts::FRAC_PI_2),
++    )];
++    assert!(point_is_in_clip(CGPoint { x: -0.5, y: 0.5 }, &rotated));
++    assert!(!point_is_in_clip(CGPoint { x: 0.5, y: 0.5 }, &rotated));
++}
++
+ #[cfg(test)]
+ #[test]
+ fn test_iter_transformed_pixels() {
+@@ -552,6 +600,7 @@ fn test_iter_transformed_pixels() {
+             rgb_fill_color: (0.0, 0.0, 0.0, 0.0),
+             blend_mode: kCGBlendModeNormal,
+             transform,
++            clip_regions: Vec::new(),
+             pixels: &mut [],
+         }
+     }
+@@ -638,6 +687,41 @@ pub(super) fn fill_rect(env: &mut Environment, context: CGContextRef, rect: CGRe
+     }
+ }
+ 
++/// Fill an ellipse in user coordinates, subject to the context's CTM and clip.
++pub(super) fn fill_ellipse(env: &mut Environment, context: CGContextRef, rect: CGRect) {
++    if rect.size.width <= 0.0 || rect.size.height <= 0.0 {
++        return;
++    }
++    let mut drawer = CGBitmapContextDrawer::new(&env.objc, &mut env.mem, context);
++    let color = drawer.rgb_fill_color();
++    for ((x, y), (u, v)) in drawer.iter_transformed_pixels(rect) {
++        if point_in_unit_ellipse(u, v) {
++            drawer.put_pixel((x, y), color, /* blend: */ true);
++        }
++    }
++}
++
++fn point_in_unit_ellipse(u: f32, v: f32) -> bool {
++    let dx = 2.0 * u - 1.0;
++    let dy = 2.0 * v - 1.0;
++    dx * dx + dy * dy <= 1.0
++}
++
++#[cfg(test)]
++#[test]
++fn ellipse_raster_uses_both_radii() {
++    let row_counts: Vec<usize> = (0..4)
++        .map(|y| {
++            (0..6)
++                .filter(|&x| point_in_unit_ellipse((x as f32 + 0.5) / 6.0, (y as f32 + 0.5) / 4.0))
++                .count()
++        })
++        .collect();
++    assert_eq!(row_counts, [4, 6, 6, 4]);
++    assert!(!point_in_unit_ellipse(0.0, 0.0));
++    assert!(point_in_unit_ellipse(0.5, 0.5));
++}
++
+ /// Implementation of `CGContextDrawImage` for `CGBitmapContext`.
+ pub(super) fn draw_image(
+     env: &mut Environment,
+diff --git a/src/frameworks/core_graphics/cg_context.rs b/src/frameworks/core_graphics/cg_context.rs
+index 897e267..208a460 100644
+--- a/src/frameworks/core_graphics/cg_context.rs
++++ b/src/frameworks/core_graphics/cg_context.rs
+@@ -6,15 +6,12 @@
+ //! `CGContext.h`
+ 
+ use super::cg_affine_transform::{CGAffineTransform, CGAffineTransformIdentity};
+-use super::cg_bitmap_context::{
+-    CGBitmapContextDrawer, CGBitmapContextGetHeight, CGBitmapContextGetWidth,
+-};
++use super::cg_bitmap_context::CGBitmapContextDrawer;
+ use super::cg_color::CGColorRef;
+ use super::cg_color_space::{
+     kCGColorSpaceModelMonochrome, kCGColorSpaceModelRGB, CGColorSpaceGetModel, CGColorSpaceRef,
+ };
+ use super::cg_font::{CGFontHostObject, CGFontRef, CGFontRelease, CGFontRetain, CGGlyph};
+-use super::cg_geometry::CGPointZero;
+ use super::cg_image::CGImageRef;
+ use super::{cg_bitmap_context, cg_color, CGFloat, CGPoint, CGRect, CGSize};
+ use crate::dyld::{export_c_func, FunctionExports};
+@@ -71,6 +68,7 @@ type ContextState = (
+     CGFontRef,                            // font
+     CGFloat,                              // font size
+     CGBlendMode,                          // blend mode
++    Vec<(CGRect, CGAffineTransform)>,     // clipping rectangles and their CTMs
+ );
+ 
+ pub(super) struct CGContextHostObject {
+@@ -83,6 +81,7 @@ pub(super) struct CGContextHostObject {
+     pub(super) blend_mode: CGBlendMode,
+     /// Text transform.
+     pub(super) text_transform: Option<CGAffineTransform>,
++    pub(super) clip_regions: Vec<(CGRect, CGAffineTransform)>,
+     pub(super) state_stack: Vec<ContextState>,
+ }
+ impl HostObject for CGContextHostObject {}
+@@ -204,24 +203,17 @@ pub fn CGContextFillRect(env: &mut Environment, context: CGContextRef, rect: CGR
+     cg_bitmap_context::fill_rect(env, context, rect, /* clear: */ false);
+ }
+ 
++pub fn CGContextFillEllipseInRect(env: &mut Environment, context: CGContextRef, rect: CGRect) {
++    cg_bitmap_context::fill_ellipse(env, context, rect);
++}
++
+ pub fn CGContextClearRect(env: &mut Environment, context: CGContextRef, rect: CGRect) {
+     cg_bitmap_context::fill_rect(env, context, rect, /* clear: */ true);
+ }
+ 
+ fn CGContextClipToRect(env: &mut Environment, context: CGContextRef, rect: CGRect) {
+-    if rect.origin == CGPointZero
+-        && rect.size.height == CGBitmapContextGetHeight(env, context) as f32
+-        && rect.size.width == CGBitmapContextGetWidth(env, context) as f32
+-    {
+-        assert!(env
+-            .objc
+-            .borrow_mut::<CGContextHostObject>(context)
+-            .transform
+-            .is_identity());
+-        // All good, clipping is not needed!
+-        return;
+-    }
+-    todo!();
++    let host_obj = env.objc.borrow_mut::<CGContextHostObject>(context);
++    host_obj.clip_regions.push((rect, host_obj.transform));
+ }
+ 
+ pub fn CGContextConcatCTM(
+@@ -276,6 +268,7 @@ fn CGContextSaveGState(env: &mut Environment, context: CGContextRef) {
+         host_obj.font,
+         host_obj.font_size,
+         host_obj.blend_mode,
++        host_obj.clip_regions.clone(),
+     ));
+     CGFontRetain(env, env.objc.borrow::<CGContextHostObject>(context).font);
+ }
+@@ -294,6 +287,7 @@ fn CGContextRestoreGState(env: &mut Environment, context: CGContextRef) {
+     host_obj.font = state.2;
+     host_obj.font_size = state.3;
+     host_obj.blend_mode = state.4;
++    host_obj.clip_regions = state.5;
+ }
+ 
+ fn CGContextSetInterpolationQuality(
+@@ -440,6 +434,7 @@ pub const FUNCTIONS: FunctionExports = &[
+     export_c_func!(CGContextSetRGBStrokeColor(_, _, _, _, _)),
+     export_c_func!(CGContextSetShadowWithColor(_, _, _, _)),
+     export_c_func!(CGContextFillRect(_, _)),
++    export_c_func!(CGContextFillEllipseInRect(_, _)),
+     export_c_func!(CGContextClearRect(_, _)),
+     export_c_func!(CGContextClipToRect(_, _)),
+     export_c_func!(CGContextConcatCTM(_, _)),
+diff --git a/src/frameworks/core_graphics/cg_geometry.rs b/src/frameworks/core_graphics/cg_geometry.rs
+index 0d29554..690ec06 100644
+--- a/src/frameworks/core_graphics/cg_geometry.rs
++++ b/src/frameworks/core_graphics/cg_geometry.rs
+@@ -270,6 +270,57 @@ fn CGRectContainsPoint(_env: &mut Environment, rect: CGRect, point: CGPoint) ->
+         && rect.origin.y + rect.size.height > point.y
+ }
+ 
++fn contains_rect(outer: CGRect, inner: CGRect) -> bool {
++    // CGRectNull is the empty set: its union with any rectangle is that
++    // rectangle, including when the rectangle itself is null.
++    if inner == CGRectNull {
++        return true;
++    }
++    if outer == CGRectNull {
++        return false;
++    }
++
++    let outer_x2 = outer.origin.x + outer.size.width;
++    let outer_y2 = outer.origin.y + outer.size.height;
++    let inner_x2 = inner.origin.x + inner.size.width;
++    let inner_y2 = inner.origin.y + inner.size.height;
++    outer.origin.x.min(outer_x2) <= inner.origin.x.min(inner_x2)
++        && outer.origin.y.min(outer_y2) <= inner.origin.y.min(inner_y2)
++        && outer.origin.x.max(outer_x2) >= inner.origin.x.max(inner_x2)
++        && outer.origin.y.max(outer_y2) >= inner.origin.y.max(inner_y2)
++}
++
++fn CGRectContainsRect(_env: &mut Environment, outer: CGRect, inner: CGRect) -> bool {
++    contains_rect(outer, inner)
++}
++
++#[cfg(test)]
++mod contains_rect_tests {
++    use super::{contains_rect, CGRect, CGRectNull};
++
++    #[test]
++    fn contains_boundaries_and_standardizes_negative_sizes() {
++        let outer: CGRect = "{{0, 0}, {10, 10}}".parse().unwrap();
++        assert!(contains_rect(outer, outer));
++        assert!(contains_rect(outer, "{{10, 10}, {0, 0}}".parse().unwrap()));
++        assert!(contains_rect(outer, "{{2, 2}, {3, 3}}".parse().unwrap()));
++        assert!(contains_rect(outer, "{{5, 5}, {-3, -3}}".parse().unwrap()));
++        assert!(!contains_rect(outer, "{{20, 20}, {0, 0}}".parse().unwrap()));
++        assert!(!contains_rect(
++            outer,
++            "{{20, 20}, {-15, -15}}".parse().unwrap()
++        ));
++    }
++
++    #[test]
++    fn null_rectangle_is_contained_by_any_rectangle() {
++        let rect: CGRect = "{{0, 0}, {10, 10}}".parse().unwrap();
++        assert!(contains_rect(rect, CGRectNull));
++        assert!(contains_rect(CGRectNull, CGRectNull));
++        assert!(!contains_rect(CGRectNull, rect));
++    }
++}
++
+ fn CGRectIntersectsRect(_env: &mut Environment, rect1: CGRect, rect2: CGRect) -> bool {
+     rect1.origin.x.max(rect2.origin.x)
+         <= (rect1.origin.x + rect1.size.width).min(rect2.origin.x + rect2.size.width)
+@@ -412,6 +463,7 @@ pub const FUNCTIONS: FunctionExports = &[
+     export_c_func!(CGSizeEqualToSize(_, _)),
+     export_c_func!(CGRectEqualToRect(_, _)),
+     export_c_func!(CGRectContainsPoint(_, _)),
++    export_c_func!(CGRectContainsRect(_, _)),
+     export_c_func!(CGRectIntersectsRect(_, _)),
+     export_c_func!(CGRectIntersection(_, _)),
+     export_c_func!(CGRectGetMinX(_)),
+diff --git a/src/frameworks/foundation.rs b/src/frameworks/foundation.rs
+index 441c507..7199340 100644
+--- a/src/frameworks/foundation.rs
++++ b/src/frameworks/foundation.rs
+@@ -19,10 +19,12 @@ pub mod _nib_archive_decoder;
+ pub mod ns_array;
+ pub mod ns_autorelease_pool;
+ pub mod ns_bundle;
++pub mod ns_calendar;
+ pub mod ns_character_set;
+ pub mod ns_coder;
+ pub mod ns_data;
+ pub mod ns_date;
++pub mod ns_date_components;
+ pub mod ns_date_formatter;
+ pub mod ns_dictionary;
+ pub mod ns_enumerator;
+@@ -31,6 +33,7 @@ pub mod ns_exception;
+ pub mod ns_file_handle;
+ pub mod ns_file_manager;
+ pub mod ns_garbage_collector;
++pub mod ns_http_cookie;
+ pub mod ns_index_path;
+ pub mod ns_invocation;
+ pub mod ns_keyed_archiver;
+@@ -68,10 +71,12 @@ pub const DYLIB: crate::dyld::HostDylib = crate::dyld::HostDylib {
+         ns_array::CLASSES,
+         ns_autorelease_pool::CLASSES,
+         ns_bundle::CLASSES,
++        ns_calendar::CLASSES,
+         ns_character_set::CLASSES,
+         ns_coder::CLASSES,
+         ns_data::CLASSES,
+         ns_date::CLASSES,
++        ns_date_components::CLASSES,
+         ns_date_formatter::CLASSES,
+         ns_dictionary::CLASSES,
+         ns_enumerator::CLASSES,
+@@ -107,9 +112,11 @@ pub const DYLIB: crate::dyld::HostDylib = crate::dyld::HostDylib {
+         ns_xml_parser::CLASSES,
+     ],
+     constant_exports: &[
++        ns_calendar::CONSTANTS,
+         ns_error::CONSTANTS,
+         ns_exception::CONSTANTS,
+         ns_file_manager::CONSTANTS,
++        ns_http_cookie::CONSTANTS,
+         ns_keyed_unarchiver::CONSTANTS,
+         ns_locale::CONSTANTS,
+         ns_run_loop::CONSTANTS,
+diff --git a/src/frameworks/foundation/ns_array.rs b/src/frameworks/foundation/ns_array.rs
+index 18f809a..10a5132 100644
+--- a/src/frameworks/foundation/ns_array.rs
++++ b/src/frameworks/foundation/ns_array.rs
+@@ -281,10 +281,13 @@ pub const CLASSES: ClassExports = objc_classes! {
+ }
+ 
+ + (id)arrayWithObjects:(id)firstObj, ...args {
+-    retain(env, firstObj);
+-    let mut objects = vec![firstObj];
++    let mut objects = Vec::new();
++    if firstObj != nil {
++        retain(env, firstObj);
++        objects.push(firstObj);
++    }
+     let mut varargs = args.start();
+-    loop {
++    while firstObj != nil {
+         let next_arg: id = varargs.next(env);
+         if next_arg.is_null() {
+             break;
+@@ -296,6 +299,22 @@ pub const CLASSES: ClassExports = objc_classes! {
+     autorelease(env, array)
+ }
+ 
++- (id)initWithObjects:(id)firstObj, ...args {
++    if firstObj == nil {
++        return this;
++    }
++    () = msg![env; this addObject:firstObj];
++    let mut varargs = args.start();
++    loop {
++        let next_arg: id = varargs.next(env);
++        if next_arg == nil {
++            break;
++        }
++        () = msg![env; this addObject:next_arg];
++    }
++    this
++}
++
+ // These probably comes from some category related to plists.
+ - (id)initWithContentsOfFile:(id)path { // NSString*
+     release(env, this);
+diff --git a/src/frameworks/foundation/ns_bundle.rs b/src/frameworks/foundation/ns_bundle.rs
+index fa7607d..938ea76 100644
+--- a/src/frameworks/foundation/ns_bundle.rs
++++ b/src/frameworks/foundation/ns_bundle.rs
+@@ -13,6 +13,7 @@ use crate::frameworks::core_foundation::cf_bundle::{
+ use crate::frameworks::foundation::ns_string::{
+     from_rust_string, to_rust_string, NSUTF8StringEncoding,
+ };
++use crate::fs::GuestPath;
+ use crate::mem::{ConstVoidPtr, MutPtr, Ptr};
+ use crate::objc::{
+     autorelease, id, msg, msg_class, nil, objc_classes, release, retain, Class, ClassExports,
+@@ -41,7 +42,7 @@ const LANG_ID_TO_LANG_PROJ: &[(&str, &[&str])] = &[
+ #[derive(Default)]
+ pub struct State {
+     main_bundle: Option<id>,
+-    localization_tables: HashMap<id, id>, // NSString* to NSDictionary*
++    localization_tables: HashMap<(id, id), id>, // (NSBundle*, NSString*) to NSDictionary*
+ }
+ 
+ pub struct NSBundleHostObject {
+@@ -65,6 +66,17 @@ pub const CLASSES: ClassExports = objc_classes! {
+ 
+ @implementation NSBundle: NSObject
+ 
+++ (id)allocWithZone:(NSZonePtr)_zone {
++    let host_object = NSBundleHostObject {
++        bundle: None,
++        bundle_path: nil,
++        bundle_identifier: nil,
++        bundle_url: None,
++        info_dictionary: None,
++    };
++    env.objc.alloc_object(this, Box::new(host_object), &mut env.mem)
++}
++
+ + (id)mainBundle {
+     if let Some(bundle) = env.framework_state.foundation.ns_bundle.main_bundle {
+         bundle
+@@ -80,20 +92,47 @@ pub const CLASSES: ClassExports = objc_classes! {
+     autorelease(env, preferredLocalizations)
+ }
+ 
++- (id)initWithPath:(id)path {
++    let path_string = if path == nil {
++        String::new()
++    } else {
++        to_rust_string(env, path).into_owned()
++    };
++    if path == nil || !env.fs.is_dir(GuestPath::new(&path_string)) {
++        release(env, this);
++        return nil;
++    }
++    retain(env, path);
++    env.objc.borrow_mut::<NSBundleHostObject>(this).bundle_path = path;
++    this
++}
++
+ - (())dealloc {
+     let &NSBundleHostObject {
+         bundle: _,
+-        bundle_path: _, // FIXME?
+-        bundle_identifier: _, // FIXME?
++        bundle_path,
++        bundle_identifier,
+         bundle_url,
+         info_dictionary,
+     } = env.objc.borrow(this);
+     if let Some(bundle_url) = bundle_url {
+         release(env, bundle_url);
+     }
++    release(env, bundle_path);
++    release(env, bundle_identifier);
+     if let Some(info_dictionary) = info_dictionary {
+         release(env, info_dictionary);
+     }
++    let cached_names: Vec<id> = env.framework_state.foundation.ns_bundle.localization_tables
++        .keys()
++        .filter_map(|&(bundle, name)| (bundle == this).then_some(name))
++        .collect();
++    for name in cached_names {
++        let dict = env.framework_state.foundation.ns_bundle.localization_tables
++            .remove(&(this, name)).unwrap();
++        release(env, name);
++        release(env, dict);
++    }
+     env.objc.dealloc_object(this, &mut env.mem)
+ }
+ 
+@@ -221,6 +260,24 @@ pub const CLASSES: ClassExports = objc_classes! {
+                ofType:(id)extension { // NSString*
+     msg![env; this pathForResource:name ofType:extension inDirectory:nil]
+ }
++- (id)pathForResource:(id)name // NSString*
++               ofType:(id)extension // NSString*
++          inDirectory:(id)directory // NSString*
++      forLocalization:(id)localization { // NSString*
++    if localization == nil {
++        return msg![env; this pathForResource:name ofType:extension inDirectory:directory];
++    }
++
++    // Explicit localization searches global resources and only the requested
++    // language's .lproj directory, independent of preferred languages.
++    let path = path_for_resource_helper(env, this, name, nil, directory, extension);
++    if path != nil {
++        return path;
++    }
++    let lproj_extension = ns_string::get_static_str(env, "lproj");
++    let lproj: id = msg![env; localization stringByAppendingPathExtension:lproj_extension];
++    path_for_resource_helper(env, this, name, lproj, directory, extension)
++}
+ - (id)URLForResource:(id)name // NSString*
+        withExtension:(id)extension // NSString *
+         subdirectory:(id)subpath { // NSString *
+@@ -259,9 +316,8 @@ pub const CLASSES: ClassExports = objc_classes! {
+     } else {
+         table_name
+     };
+-    // TODO: support arbitrary bundles, not only main one
+-    assert_eq!(this, env.framework_state.foundation.ns_bundle.main_bundle.unwrap());
+-    let dict = if let Some(&table_dict) = env.framework_state.foundation.ns_bundle.localization_tables.get(&name) {
++    let cache_key = (this, name);
++    let dict = if let Some(&table_dict) = env.framework_state.foundation.ns_bundle.localization_tables.get(&cache_key) {
+         table_dict
+     } else {
+         let extension = ns_string::get_static_str(env, "strings");
+@@ -269,7 +325,7 @@ pub const CLASSES: ClassExports = objc_classes! {
+         if dict_url == nil {
+             log!("Warning: Unable to locate localization table named '{}', caching as nil", to_rust_string(env, name));
+             retain(env, name);
+-            env.framework_state.foundation.ns_bundle.localization_tables.insert(name, nil);
++            env.framework_state.foundation.ns_bundle.localization_tables.insert(cache_key, nil);
+             nil
+         } else {
+             let dict = {
+@@ -284,7 +340,7 @@ pub const CLASSES: ClassExports = objc_classes! {
+             };
+             retain(env, name);
+             retain(env, dict);
+-            env.framework_state.foundation.ns_bundle.localization_tables.insert(name, dict);
++            env.framework_state.foundation.ns_bundle.localization_tables.insert(cache_key, dict);
+             dict
+         }
+     };
+diff --git a/src/frameworks/foundation/ns_calendar.rs b/src/frameworks/foundation/ns_calendar.rs
+new file mode 100644
+index 0000000..c6d96e4
+--- /dev/null
++++ b/src/frameworks/foundation/ns_calendar.rs
+@@ -0,0 +1,72 @@
++/*
++ * This Source Code Form is subject to the terms of the Mozilla Public
++ * License, v. 2.0. If a copy of the MPL was not distributed with this
++ * file, You can obtain one at https://mozilla.org/MPL/2.0/.
++ */
++//! `NSCalendar`.
++
++use super::ns_date::NSDateHostObject;
++use super::ns_date_components::NSDateComponentsHostObject;
++use super::ns_string::to_rust_string;
++use super::NSUInteger;
++use crate::dyld::{ConstantExports, HostConstant};
++use crate::frameworks::core_foundation::time::SECS_FROM_UNIX_TO_APPLE_EPOCHS;
++use crate::libc::time::timestamp_to_calendar_date;
++use crate::objc::{
++    autorelease, id, msg_class, nil, objc_classes, release, retain, ClassExports, HostObject,
++    NSZonePtr,
++};
++
++pub const CONSTANTS: ConstantExports =
++    &[("_NSGregorianCalendar", HostConstant::NSString("gregorian"))];
++
++#[derive(Default)]
++struct NSCalendarHostObject {
++    identifier: id,
++}
++impl HostObject for NSCalendarHostObject {}
++
++pub const CLASSES: ClassExports = objc_classes! {
++
++(env, this, _cmd);
++
++@implementation NSCalendar: NSObject
++
+++ (id)allocWithZone:(NSZonePtr)_zone {
++    let host_object = Box::<NSCalendarHostObject>::default();
++    env.objc.alloc_object(this, host_object, &mut env.mem)
++}
++
++- (id)initWithCalendarIdentifier:(id)identifier {
++    retain(env, identifier);
++    env.objc.borrow_mut::<NSCalendarHostObject>(this).identifier = identifier;
++    this
++}
++
++- (id)calendarIdentifier {
++    env.objc.borrow::<NSCalendarHostObject>(this).identifier
++}
++
++- (id)components:(NSUInteger)units fromDate:(id)date {
++    let identifier = env.objc.borrow::<NSCalendarHostObject>(this).identifier;
++    assert_eq!(to_rust_string(env, identifier), "gregorian");
++
++    let absolute_time = env.objc.borrow::<NSDateHostObject>(date).time_interval;
++    let unix_time = (absolute_time + SECS_FROM_UNIX_TO_APPLE_EPOCHS as f64).floor() as i32;
++    let date_fields = timestamp_to_calendar_date(unix_time);
++
++    let components: id = msg_class![env; NSDateComponents alloc];
++    *env.objc.borrow_mut::<NSDateComponentsHostObject>(components) =
++        NSDateComponentsHostObject::from_gregorian(units, date_fields);
++    autorelease(env, components)
++}
++
++- (())dealloc {
++    let identifier = std::mem::replace(&mut env.objc.borrow_mut::<NSCalendarHostObject>(this).identifier, nil);
++    release(env, identifier);
++    env.objc.dealloc_object(this, &mut env.mem)
++}
++
++@end
++
++};
+diff --git a/src/frameworks/foundation/ns_data.rs b/src/frameworks/foundation/ns_data.rs
+index cc40c2e..2e54ff4 100644
+--- a/src/frameworks/foundation/ns_data.rs
++++ b/src/frameworks/foundation/ns_data.rs
+@@ -22,6 +22,15 @@ pub(super) struct NSDataHostObject {
+ }
+ impl HostObject for NSDataHostObject {}
+ 
++fn replaced_bytes(original: &[u8], start: usize, removed: usize, inserted: &[u8]) -> Vec<u8> {
++    assert!(start <= original.len() && removed <= original.len() - start);
++    let mut result = Vec::with_capacity(original.len() - removed + inserted.len());
++    result.extend_from_slice(&original[..start]);
++    result.extend_from_slice(inserted);
++    result.extend_from_slice(&original[start + removed..]);
++    result
++}
++
+ pub const CLASSES: ClassExports = objc_classes! {
+ 
+ (env, this, _cmd);
+@@ -340,6 +349,41 @@ pub const CLASSES: ClassExports = objc_classes! {
+     log_dbg!("setLength bytes {:?}, new_bytes {:?}; length {}, new_len {}", bytes, new_bytes, length, new_length);
+ }
+ 
++- (())replaceBytesInRange:(NSRange)range
++                withBytes:(ConstVoidPtr)new_bytes
++                   length:(NSUInteger)new_length {
++    let start = range.location as usize;
++    let removed = range.length as usize;
++    let &NSDataHostObject { bytes, length, free_when_done } = env.objc.borrow(this);
++    let original = if length == 0 {
++        Vec::new()
++    } else {
++        env.mem.bytes_at(bytes.cast(), length).to_vec()
++    };
++    let inserted = if new_length == 0 {
++        Vec::new()
++    } else {
++        env.mem.bytes_at(new_bytes.cast(), new_length).to_vec()
++    };
++    let result = replaced_bytes(&original, start, removed, &inserted);
++    let replacement = if result.is_empty() {
++        Ptr::null()
++    } else {
++        let replacement = env.mem.alloc(result.len().try_into().unwrap());
++        env.mem
++            .bytes_at_mut(replacement.cast(), result.len().try_into().unwrap())
++            .copy_from_slice(&result);
++        replacement
++    };
++    if free_when_done && !bytes.is_null() {
++        env.mem.free(bytes);
++    }
++    let host = env.objc.borrow_mut::<NSDataHostObject>(this);
++    host.bytes = replacement;
++    host.length = result.len().try_into().unwrap();
++    host.free_when_done = true;
++}
++
+ @end
+ 
+ };
+@@ -350,3 +394,15 @@ pub fn to_rust_slice(env: &mut Environment, data: id) -> &[u8] {
+     env.mem
+         .bytes_at(borrowed_data.bytes.cast(), borrowed_data.length)
+ }
++
++#[cfg(test)]
++mod replace_bytes_tests {
++    use super::replaced_bytes;
++
++    #[test]
++    fn replacing_range_preserves_prefix_and_suffix() {
++        assert_eq!(replaced_bytes(b"abcdef", 2, 2, b"XYZ"), b"abXYZef");
++        assert_eq!(replaced_bytes(b"abcdef", 2, 3, b""), b"abf");
++        assert_eq!(replaced_bytes(b"abcdef", 6, 0, b"!"), b"abcdef!");
++    }
++}
+diff --git a/src/frameworks/foundation/ns_date_components.rs b/src/frameworks/foundation/ns_date_components.rs
+new file mode 100644
+index 0000000..cab379b
+--- /dev/null
++++ b/src/frameworks/foundation/ns_date_components.rs
+@@ -0,0 +1,130 @@
++/*
++ * This Source Code Form is subject to the terms of the Mozilla Public
++ * License, v. 2.0. If a copy of the MPL was not distributed with this
++ * file, You can obtain one at https://mozilla.org/MPL/2.0/.
++ */
++//! `NSDateComponents`.
++
++use super::{NSInteger, NSUInteger};
++use crate::libc::time::tm;
++use crate::objc::{id, objc_classes, ClassExports, HostObject, NSZonePtr};
++
++pub(super) const NS_UNDEFINED_DATE_COMPONENT: NSInteger = NSInteger::MAX;
++
++#[derive(Debug)]
++pub(super) struct NSDateComponentsHostObject {
++    year: NSInteger,
++    month: NSInteger,
++    day: NSInteger,
++    hour: NSInteger,
++    minute: NSInteger,
++    second: NSInteger,
++}
++impl HostObject for NSDateComponentsHostObject {}
++
++impl Default for NSDateComponentsHostObject {
++    fn default() -> Self {
++        Self {
++            year: NS_UNDEFINED_DATE_COMPONENT,
++            month: NS_UNDEFINED_DATE_COMPONENT,
++            day: NS_UNDEFINED_DATE_COMPONENT,
++            hour: NS_UNDEFINED_DATE_COMPONENT,
++            minute: NS_UNDEFINED_DATE_COMPONENT,
++            second: NS_UNDEFINED_DATE_COMPONENT,
++        }
++    }
++}
++
++impl NSDateComponentsHostObject {
++    pub(super) fn from_gregorian(units: NSUInteger, date: tm) -> Self {
++        let mut components = Self::default();
++        if units & (1 << 2) != 0 {
++            components.year = date.tm_year + 1900;
++        }
++        if units & (1 << 3) != 0 {
++            components.month = date.tm_mon + 1;
++        }
++        if units & (1 << 4) != 0 {
++            components.day = date.tm_mday;
++        }
++        if units & (1 << 5) != 0 {
++            components.hour = date.tm_hour;
++        }
++        if units & (1 << 6) != 0 {
++            components.minute = date.tm_min;
++        }
++        if units & (1 << 7) != 0 {
++            components.second = date.tm_sec;
++        }
++        components
++    }
++}
++
++pub const CLASSES: ClassExports = objc_classes! {
++
++(env, this, _cmd);
++
++@implementation NSDateComponents: NSObject
++
+++ (id)allocWithZone:(NSZonePtr)_zone {
++    let host_object = Box::<NSDateComponentsHostObject>::default();
++    env.objc.alloc_object(this, host_object, &mut env.mem)
++}
++
++- (NSInteger)year {
++    env.objc.borrow::<NSDateComponentsHostObject>(this).year
++}
++
++- (NSInteger)month {
++    env.objc.borrow::<NSDateComponentsHostObject>(this).month
++}
++
++- (NSInteger)day {
++    env.objc.borrow::<NSDateComponentsHostObject>(this).day
++}
++
++- (NSInteger)hour {
++    env.objc.borrow::<NSDateComponentsHostObject>(this).hour
++}
++
++- (NSInteger)minute {
++    env.objc.borrow::<NSDateComponentsHostObject>(this).minute
++}
++
++- (NSInteger)second {
++    env.objc.borrow::<NSDateComponentsHostObject>(this).second
++}
++
++@end
++
++};
++
++#[cfg(test)]
++mod tests {
++    use super::*;
++    use crate::libc::time::timestamp_to_calendar_date;
++
++    #[test]
++    fn requested_gregorian_components() {
++        // 2024-02-29 12:34:56 UTC
++        let date = timestamp_to_calendar_date(1_709_210_096);
++        let components = NSDateComponentsHostObject::from_gregorian(0xfc, date);
++        assert_eq!(
++            (components.year, components.month, components.day),
++            (2024, 2, 29)
++        );
++        assert_eq!(
++            (components.hour, components.minute, components.second),
++            (12, 34, 56)
++        );
++    }
++
++    #[test]
++    fn unrequested_components_are_undefined() {
++        let date = timestamp_to_calendar_date(1_709_210_096);
++        let components = NSDateComponentsHostObject::from_gregorian(1 << 2, date);
++        assert_eq!(components.year, 2024);
++        assert_eq!(components.month, NS_UNDEFINED_DATE_COMPONENT);
++        assert_eq!(components.day, NS_UNDEFINED_DATE_COMPONENT);
++    }
++}
+diff --git a/src/frameworks/foundation/ns_dictionary.rs b/src/frameworks/foundation/ns_dictionary.rs
+index 7e49445..beff680 100644
+--- a/src/frameworks/foundation/ns_dictionary.rs
++++ b/src/frameworks/foundation/ns_dictionary.rs
+@@ -472,6 +472,23 @@ pub const CLASSES: ClassExports = objc_classes! {
+ 
+ // TODO
+ 
++- (id)allValues {
++    let keys: id = msg![env; this allKeys];
++    let values: id = msg_class![env; NSMutableArray array];
++    let count: NSUInteger = msg![env; keys count];
++    for i in 0..count {
++        let key: id = msg![env; keys objectAtIndex:i];
++        let value: id = msg![env; this objectForKey:key];
++        () = msg![env; values addObject:value];
++    }
++    values
++}
++
++- (id)objectEnumerator {
++    let values: id = msg![env; this allValues];
++    msg![env; values objectEnumerator]
++}
++
+ - (id)valueForKey:(id)key { // NSString*
+     let key_str = to_rust_string(env, key);
+     // TODO: strip '@' and call super
+@@ -799,6 +816,17 @@ pub const CLASSES: ClassExports = objc_classes! {
+          forKey:(id)key {
+     // TODO: raise NSInvalidArgumentException
+     assert_ne!(object, nil);
++    if key == nil {
++        let class = msg![env; object class];
++        log!(
++            "NSMutableDictionary setObject:forKey: received nil key with value class {}",
++            env.objc.get_class_name(class)
++        );
++        if env.options.tolerate_nil_dictionary_keys {
++            log!("Ignoring nil-key insertion in opted-in compatibility mode");
++            return;
++        }
++    }
+     // TODO: raise NSInvalidArgumentException
+     assert_ne!(key, nil);
+     let mut host_obj: DictionaryHostObject = std::mem::take(env.objc.borrow_mut(this));
+diff --git a/src/frameworks/foundation/ns_http_cookie.rs b/src/frameworks/foundation/ns_http_cookie.rs
+new file mode 100644
+index 0000000..5905482
+--- /dev/null
++++ b/src/frameworks/foundation/ns_http_cookie.rs
+@@ -0,0 +1,15 @@
++/*
++ * This Source Code Form is subject to the terms of the Mozilla Public
++ * License, v. 2.0. If a copy of the MPL was not distributed with this
++ * file, You can obtain one at https://mozilla.org/MPL/2.0/.
++ */
++//! HTTP cookie property keys.
++
++use crate::dyld::{ConstantExports, HostConstant};
++
++pub const CONSTANTS: ConstantExports = &[
++    ("_NSHTTPCookieName", HostConstant::NSString("Name")),
++    ("_NSHTTPCookieValue", HostConstant::NSString("Value")),
++    ("_NSHTTPCookieDomain", HostConstant::NSString("Domain")),
++    ("_NSHTTPCookiePath", HostConstant::NSString("Path")),
++];
+diff --git a/src/frameworks/foundation/ns_invocation.rs b/src/frameworks/foundation/ns_invocation.rs
+index b5d1e58..bd2bf64 100644
+--- a/src/frameworks/foundation/ns_invocation.rs
++++ b/src/frameworks/foundation/ns_invocation.rs
+@@ -7,6 +7,7 @@
+ 
+ use crate::abi::{extend_stack_for_args, write_next_arg, GuestArg};
+ use crate::cpu::Cpu;
++use crate::frameworks::core_graphics::CGRect;
+ use crate::frameworks::foundation::{NSInteger, NSUInteger};
+ use crate::libc::string::strdup;
+ use crate::mem::{ConstPtr, MutPtr, MutVoidPtr};
+@@ -142,6 +143,16 @@ pub const CLASSES: ClassExports = objc_classes! {
+             let arg = env.mem.read(arg_loc);
+             env.mem.alloc_and_write(arg).cast()
+         }
++        "c" => {
++            let arg_loc: MutPtr<u8> = arg_loc.cast();
++            let arg = env.mem.read(arg_loc);
++            env.mem.alloc_and_write(arg).cast()
++        }
++        "{CGRect={CGPoint=ff}{CGSize=ff}}" => {
++            let arg_loc: MutPtr<CGRect> = arg_loc.cast();
++            let arg = env.mem.read(arg_loc);
++            env.mem.alloc_and_write(arg).cast()
++        }
+         "@" => {
+             assert!(!arguments_retained); // TODO
+             let arg_loc: MutPtr<id> = arg_loc.cast();
+@@ -194,6 +205,7 @@ pub const CLASSES: ClassExports = objc_classes! {
+             ":" => <SEL as GuestArg>::REG_COUNT,
+             "f" => <f32 as GuestArg>::REG_COUNT,
+             "c" => <u8 as GuestArg>::REG_COUNT,
++            "{CGRect={CGPoint=ff}{CGSize=ff}}" => <CGRect as GuestArg>::REG_COUNT,
+             "*" => <MutPtr<u8> as GuestArg>::REG_COUNT,
+             // pointer cases
+             _ if arg_type.starts_with('^') => <MutVoidPtr as GuestArg>::REG_COUNT,
+@@ -248,6 +260,12 @@ pub const CLASSES: ClassExports = objc_classes! {
+                 let regs = env.cpu.regs_mut();
+                 write_next_arg::<u8>(&mut reg_offset, regs, &mut env.mem, arg_val);
+             }
++            "{CGRect={CGPoint=ff}{CGSize=ff}}" => {
++                let arg: ConstPtr<CGRect> = arg_slot.cast().cast_const();
++                let arg_val = env.mem.read(arg);
++                let regs = env.cpu.regs_mut();
++                write_next_arg::<CGRect>(&mut reg_offset, regs, &mut env.mem, arg_val);
++            }
+             "*" => {
+                 let arg: ConstPtr<MutPtr<u8>> = arg_slot.cast().cast_const();
+                 let arg_val = env.mem.read(arg);
+diff --git a/src/frameworks/foundation/ns_method_signature.rs b/src/frameworks/foundation/ns_method_signature.rs
+index 40e9ac8..3d7931a 100644
+--- a/src/frameworks/foundation/ns_method_signature.rs
++++ b/src/frameworks/foundation/ns_method_signature.rs
+@@ -106,6 +106,16 @@ fn parse_signature_inner(env: &mut Environment, curr: ConstPtr<u8>) -> (GuestUSi
+             let (scanned, read, size) = parse_signature_inner(env, curr + 1);
+             (scanned + 1, read + 1, size)
+         }
++        b'{' => {
++            let type_len = struct_type_length(env.mem.cstr_at(curr));
++            let mut size = 0;
++            idx = type_len.try_into().unwrap();
++            while let cc @ b'0'..=b'9' = env.mem.read(curr + idx) {
++                size = size * 10 + (cc - b'0') as u32;
++                idx += 1;
++            }
++            (idx, type_len.try_into().unwrap(), size)
++        }
+         b'v' | b'@' | b':' | b'f' | b'c' | b'*' | b'i' => {
+             idx += 1;
+             let mut size = 0;
+@@ -118,3 +128,32 @@ fn parse_signature_inner(env: &mut Environment, curr: ConstPtr<u8>) -> (GuestUSi
+         _ => unimplemented!("parse_signature_inner: {}", c as char),
+     }
+ }
++
++fn struct_type_length(bytes: &[u8]) -> usize {
++    let mut depth = 0;
++    for (idx, byte) in bytes.iter().enumerate() {
++        match byte {
++            b'{' => depth += 1,
++            b'}' => {
++                depth -= 1;
++                if depth == 0 {
++                    return idx + 1;
++                }
++            }
++            _ => {}
++        }
++    }
++    panic!("Unterminated Objective-C struct type encoding")
++}
++
++#[cfg(test)]
++mod tests {
++    use super::struct_type_length;
++
++    #[test]
++    fn nested_struct_encoding_stops_before_argument_offset() {
++        let encoding = b"{CGRect={CGPoint=ff}{CGSize=ff}}8c24@28";
++        assert_eq!(struct_type_length(encoding), 32);
++        assert_eq!(&encoding[struct_type_length(encoding)..], b"8c24@28");
++    }
++}
+diff --git a/src/frameworks/foundation/ns_object.rs b/src/frameworks/foundation/ns_object.rs
+index 6e160fa..df81a1d 100644
+--- a/src/frameworks/foundation/ns_object.rs
++++ b/src/frameworks/foundation/ns_object.rs
+@@ -68,7 +68,12 @@ pub const CLASSES: ClassExports = objc_classes! {
+ 
+ + (())cancelPreviousPerformRequestsWithTarget:(id)target selector:(SEL)selector object:(id)arg {
+     let run_loop: id = msg_class![env; NSRunLoop currentRunLoop];
+-    cancel_perform_requests(env, run_loop, target, selector, arg);
++    cancel_perform_requests(env, run_loop, target, Some(selector), Some(arg));
++}
++
+++ (())cancelPreviousPerformRequestsWithTarget:(id)target {
++    let run_loop: id = msg_class![env; NSRunLoop currentRunLoop];
++    cancel_perform_requests(env, run_loop, target, None, None);
+ }
+ 
+ + (bool)accessInstanceVariablesDirectly {
+@@ -148,10 +153,18 @@ pub const CLASSES: ClassExports = objc_classes! {
+     this == other
+ }
+ 
+-// TODO: Instance description and debugDescription.
+-// This is not hard to add, but before adding a fallback implementation of it,
+-// we should make sure all the Foundation classes' overrides of it are there,
+-// to prevent weird behavior.
++- (id)description {
++    let class: Class = msg![env; this class];
++    let name = env.objc.get_class_name(class);
++    let description = format!("<{name}: {this:?}>");
++    let description = from_rust_string(env, description);
++    autorelease(env, description)
++}
++
++- (id)debugDescription {
++    msg![env; this description]
++}
++
+ // TODO: localized description methods also? (not sure if NSObject has them)
+ 
+ // Helper for NSCopying
+diff --git a/src/frameworks/foundation/ns_run_loop.rs b/src/frameworks/foundation/ns_run_loop.rs
+index f473e09..5646b99 100644
+--- a/src/frameworks/foundation/ns_run_loop.rs
++++ b/src/frameworks/foundation/ns_run_loop.rs
+@@ -245,33 +245,30 @@ pub(super) fn add_perform_request(
+     semaphore
+ }
+ 
+-/// Cancels a selector that was previously requested by [add_perform_request].
+-/// The argument arg is compared via isEqual, [as documented by Apple]
++/// Cancels selectors previously requested by [add_perform_request].
++/// If selector and argument are specified, the argument is compared via isEqual, [as documented by Apple]
+ /// (<https://developer.apple.com/documentation/objectivec/nsobject/1410849-cancelpreviousperformrequestswit?language=objc>)
+ pub(super) fn cancel_perform_requests(
+     env: &mut Environment,
+     run_loop: id,
+     target: id,
+-    selector: SEL,
+-    argument: id,
++    selector: Option<SEL>,
++    argument: Option<id>,
+ ) {
+-    log_dbg!(
+-        "Removing object selector request {target:?} {:?} {argument:?} on run loop {run_loop:?}",
+-        selector.as_str(env.mem.as_mut())
+-    );
++    log_dbg!("Removing object selector requests for {target:?} on run loop {run_loop:?}");
+     let mut new_selector_objects = VecDeque::new();
+     let host_object = env.objc.borrow_mut::<NSRunLoopHostObject>(run_loop);
+     let mut selector_objects = std::mem::take(&mut host_object.selector_objects);
+     while let Some(obj) = selector_objects.pop_front() {
+-        if obj.target != target || obj.selector != selector {
++        if obj.target != target || selector.is_some_and(|selector| obj.selector != selector) {
+             new_selector_objects.push_back(obj);
+             continue;
+         }
+         let curr_arg = obj.argument;
+-        let arg_equal = if curr_arg.is_null() {
+-            argument.is_null()
+-        } else {
+-            msg![env; curr_arg isEqual:argument]
++        let arg_equal = match argument {
++            None => true,
++            Some(argument) if curr_arg.is_null() => argument.is_null(),
++            Some(argument) => msg![env; curr_arg isEqual:argument],
+         };
+         if arg_equal {
+             let ObjectSelectorSource {
+@@ -440,6 +437,7 @@ pub fn run_run_loop(
+ 
+         if is_main_run_loop {
+             media_player::handle_players(env);
++            uikit::ui_view::layout_pending_views(env);
+         }
+ 
+         // Unfortunately, touchHLE has to poll for certain things repeatedly;
+diff --git a/src/frameworks/foundation/ns_string.rs b/src/frameworks/foundation/ns_string.rs
+index 1955f2b..2143687 100644
+--- a/src/frameworks/foundation/ns_string.rs
++++ b/src/frameworks/foundation/ns_string.rs
+@@ -1377,8 +1377,11 @@ pub const CLASSES: ClassExports = objc_classes! {
+ - (id)initWithBytes:(ConstPtr<u8>)bytes
+              length:(NSUInteger)len
+            encoding:(NSStringEncoding)encoding {
+-    // TODO: error handling
+     let slice = env.mem.bytes_at(bytes, len);
++    if encoding == NSASCIIStringEncoding && !slice.is_ascii() {
++        release(env, this);
++        return nil;
++    }
+     let host_object = StringHostObject::decode(Cow::Borrowed(slice), encoding);
+ 
+     *env.objc.borrow_mut(this) = host_object;
+@@ -1597,8 +1600,11 @@ pub const CLASSES: ClassExports = objc_classes! {
+ - (id)initWithBytes:(ConstPtr<u8>)bytes
+              length:(NSUInteger)len
+            encoding:(NSStringEncoding)encoding {
+-    // TODO: error handling
+     let slice = env.mem.bytes_at(bytes, len);
++    if encoding == NSASCIIStringEncoding && !slice.is_ascii() {
++        release(env, this);
++        return nil;
++    }
+     let host_object = StringHostObject::decode(Cow::Borrowed(slice), encoding);
+ 
+     *env.objc.borrow_mut(this) = host_object;
+diff --git a/src/frameworks/foundation/ns_url.rs b/src/frameworks/foundation/ns_url.rs
+index 9111ce3..f5de200 100644
+--- a/src/frameworks/foundation/ns_url.rs
++++ b/src/frameworks/foundation/ns_url.rs
+@@ -34,6 +34,71 @@ enum NSURLHostObject {
+ }
+ impl HostObject for NSURLHostObject {}
+ 
++/// Extract the authority's host without resolving or contacting the URL.
++fn url_authority(url: &str) -> Option<&str> {
++    let (scheme, rest) = url.split_once("://")?;
++    if scheme.is_empty()
++        || !scheme
++            .bytes()
++            .all(|b| b.is_ascii_alphanumeric() || b"+-.".contains(&b))
++    {
++        return None;
++    }
++    rest.split(['/', '?', '#']).next()?.rsplit('@').next()
++}
++
++fn host_from_url_string(url: &str) -> Option<String> {
++    let host_and_port = url_authority(url)?;
++    let host = if let Some(bracketed) = host_and_port.strip_prefix('[') {
++        let (host, suffix) = bracketed.split_once(']')?;
++        if !suffix.is_empty() && !suffix.starts_with(':') {
++            return None;
++        }
++        host
++    } else {
++        let (host, port) = host_and_port.split_once(':').unwrap_or((host_and_port, ""));
++        if !port.bytes().all(|b| b.is_ascii_digit()) {
++            return None;
++        }
++        host
++    };
++    if host.is_empty() {
++        return None;
++    }
++
++    let mut decoded = Vec::with_capacity(host.len());
++    let bytes = host.as_bytes();
++    let mut i = 0;
++    while i < bytes.len() {
++        if bytes[i] == b'%' {
++            let hex = bytes.get(i + 1..i + 3)?;
++            let digit = |b: u8| (b as char).to_digit(16).map(|v| v as u8);
++            decoded.push((digit(hex[0])? << 4) | digit(hex[1])?);
++            i += 3;
++        } else {
++            decoded.push(bytes[i]);
++            i += 1;
++        }
++    }
++    String::from_utf8(decoded).ok()
++}
++
++fn port_from_url_string(url: &str) -> Option<i32> {
++    let host_and_port = url_authority(url)?;
++    let port = if let Some(bracketed) = host_and_port.strip_prefix('[') {
++        let (_, suffix) = bracketed.split_once(']')?;
++        suffix.strip_prefix(':')?
++    } else {
++        let (_, port) = host_and_port.split_once(':')?;
++        port
++    };
++    if port.is_empty() || !port.bytes().all(|b| b.is_ascii_digit()) {
++        return None;
++    }
++    let port: u16 = port.parse().ok()?;
++    Some(i32::from(port))
++}
++
+ pub const CLASSES: ClassExports = objc_classes! {
+ 
+ (env, this, _cmd);
+@@ -160,6 +225,31 @@ pub const CLASSES: ClassExports = objc_classes! {
+     this
+ }
+ 
++- (id)host {
++    let NSURLHostObject::OtherURL { ns_string } = *env.objc.borrow(this) else {
++        return nil;
++    };
++    let url = to_rust_string(env, ns_string);
++    match host_from_url_string(&url) {
++        Some(host) => {
++            let result = from_rust_string(env, host);
++            autorelease(env, result)
++        }
++        None => nil,
++    }
++}
++
++- (id)port {
++    let NSURLHostObject::OtherURL { ns_string } = *env.objc.borrow(this) else {
++        return nil;
++    };
++    let url = to_rust_string(env, ns_string);
++    match port_from_url_string(&url) {
++        Some(port) => msg_class![env; NSNumber numberWithInt:port],
++        None => nil,
++    }
++}
++
+ - (bool)getFileSystemRepresentation:(MutPtr<u8>)buffer
+                           maxLength:(NSUInteger)buffer_size {
+     let &NSURLHostObject::FileURL { ns_string, .. } = env.objc.borrow(this) else {
+@@ -213,3 +303,38 @@ pub fn to_rust_path(env: &mut Environment, url: id) -> Cow<'static, GuestPath> {
+         Cow::Owned(path_buf) => Cow::Owned(path_buf.into()),
+     }
+ }
++
++#[cfg(test)]
++mod host_tests {
++    use super::{host_from_url_string, port_from_url_string};
++
++    #[test]
++    fn extracts_authority_host_without_userinfo_or_port() {
++        assert_eq!(
++            host_from_url_string("https://user:pass@example.com:443/path?x=1"),
++            Some("example.com".into())
++        );
++        assert_eq!(
++            host_from_url_string("https://%65xample.com/path"),
++            Some("example.com".into())
++        );
++        assert_eq!(
++            host_from_url_string("https://[::1]:8443/path"),
++            Some("::1".into())
++        );
++        assert_eq!(port_from_url_string("https://[::1]:8443/path"), Some(8443));
++        assert_eq!(
++            port_from_url_string("https://user@example.com:443/path"),
++            Some(443)
++        );
++    }
++
++    #[test]
++    fn returns_none_when_url_has_no_host() {
++        assert_eq!(host_from_url_string("/local/path"), None);
++        assert_eq!(host_from_url_string("https:///path"), None);
++        assert_eq!(host_from_url_string("https://example.com:bad/path"), None);
++        assert_eq!(port_from_url_string("https://example.com/path"), None);
++        assert_eq!(port_from_url_string("https://example.com:65536/path"), None);
++    }
++}
+diff --git a/src/frameworks/media_player.rs b/src/frameworks/media_player.rs
+index f848ce9..8fb74bd 100644
+--- a/src/frameworks/media_player.rs
++++ b/src/frameworks/media_player.rs
+@@ -10,6 +10,7 @@ mod media_item_collection;
+ mod media_library;
+ mod media_picker_controller;
+ mod media_playlist;
++mod media_property_predicate;
+ mod media_query;
+ mod movie_player;
+ mod music_player;
+@@ -26,8 +27,13 @@ pub const DYLIB: crate::dyld::HostDylib = crate::dyld::HostDylib {
+         media_picker_controller::CLASSES,
+         media_playlist::CLASSES,
+         media_query::CLASSES,
++        media_property_predicate::CLASSES,
++    ],
++    constant_exports: &[
++        movie_player::CONSTANTS,
++        music_player::CONSTANTS,
++        media_entity::CONSTANTS,
+     ],
+-    constant_exports: &[movie_player::CONSTANTS, music_player::CONSTANTS],
+     function_exports: &[],
+ };
+ 
+diff --git a/src/frameworks/media_player/media_entity.rs b/src/frameworks/media_player/media_entity.rs
+index b07fd18..3d44712 100644
+--- a/src/frameworks/media_player/media_entity.rs
++++ b/src/frameworks/media_player/media_entity.rs
+@@ -5,8 +5,21 @@
+  */
+ //! `MPMediaEntity`.
+ 
++use crate::dyld::{ConstantExports, HostConstant};
+ use crate::objc::{objc_classes, ClassExports};
+ 
++pub const CONSTANTS: ConstantExports = &[
++    (
++        "_MPMediaItemPropertyArtist",
++        HostConstant::NSString("artist"),
++    ),
++    ("_MPMediaItemPropertyTitle", HostConstant::NSString("title")),
++    (
++        "_MPMediaItemPropertyAlbumTitle",
++        HostConstant::NSString("albumTitle"),
++    ),
++];
++
+ pub const CLASSES: ClassExports = objc_classes! {
+ 
+ (env, this, _cmd);
+diff --git a/src/frameworks/media_player/media_picker_controller.rs b/src/frameworks/media_player/media_picker_controller.rs
+index 9faaa9b..a5f38f3 100644
+--- a/src/frameworks/media_player/media_picker_controller.rs
++++ b/src/frameworks/media_player/media_picker_controller.rs
+@@ -5,14 +5,77 @@
+  */
+ //! `MPMediaPickerController`.
+ 
+-use crate::objc::{objc_classes, ClassExports};
++use crate::frameworks::uikit::ui_view_controller::UIViewControllerHostObject;
++use crate::objc::{
++    id, impl_HostObject_with_superclass, msg_super, nil, objc_classes, release, retain,
++    ClassExports, NSZonePtr,
++};
++
++#[derive(Default)]
++struct MPMediaPickerControllerHostObject {
++    superclass: UIViewControllerHostObject,
++    // Delegates are weak references in UIKit.
++    delegate: id,
++    allows_picking_multiple_items: bool,
++    prompt: id,
++}
++impl_HostObject_with_superclass!(MPMediaPickerControllerHostObject);
+ 
+ pub const CLASSES: ClassExports = objc_classes! {
+ 
+ (env, this, _cmd);
+ 
+ @implementation MPMediaPickerController: UIViewController
+-// TODO
++
+++ (id)allocWithZone:(NSZonePtr)_zone {
++    env.objc.alloc_object(
++        this,
++        Box::<MPMediaPickerControllerHostObject>::default(),
++        &mut env.mem,
++    )
++}
++
++- (id)initWithMediaTypes:(u32)_media_types {
++    msg_super![env; this init]
++}
++
++- (())setDelegate:(id)delegate {
++    env.objc.borrow_mut::<MPMediaPickerControllerHostObject>(this).delegate = delegate;
++}
++
++- (id)delegate {
++    env.objc.borrow::<MPMediaPickerControllerHostObject>(this).delegate
++}
++
++- (())setAllowsPickingMultipleItems:(bool)allows {
++    env.objc.borrow_mut::<MPMediaPickerControllerHostObject>(this)
++        .allows_picking_multiple_items = allows;
++}
++
++- (bool)allowsPickingMultipleItems {
++    env.objc.borrow::<MPMediaPickerControllerHostObject>(this)
++        .allows_picking_multiple_items
++}
++
++- (())setPrompt:(id)prompt {
++    let prompt = retain(env, prompt);
++    let state = env.objc.borrow_mut::<MPMediaPickerControllerHostObject>(this);
++    let old_prompt = std::mem::replace(&mut state.prompt, prompt);
++    release(env, old_prompt);
++}
++
++- (id)prompt {
++    env.objc.borrow::<MPMediaPickerControllerHostObject>(this).prompt
++}
++
++- (())dealloc {
++    let prompt = env.objc.borrow::<MPMediaPickerControllerHostObject>(this).prompt;
++    if prompt != nil {
++        release(env, prompt);
++    }
++    let _: () = msg_super![env; this dealloc];
++}
++
+ @end
+ 
+ };
+diff --git a/src/frameworks/media_player/media_property_predicate.rs b/src/frameworks/media_player/media_property_predicate.rs
+new file mode 100644
+index 0000000..07bd982
+--- /dev/null
++++ b/src/frameworks/media_player/media_property_predicate.rs
+@@ -0,0 +1,67 @@
++/*
++ * This Source Code Form is subject to the terms of the Mozilla Public
++ * License, v. 2.0. If a copy of the MPL was not distributed with this
++ * file, You can obtain one at https://mozilla.org/MPL/2.0/.
++ */
++//! `MPMediaPropertyPredicate` for an emulated empty media library.
++
++use crate::objc::{
++    autorelease, id, nil, objc_classes, release, retain, ClassExports, HostObject, NSZonePtr,
++};
++
++struct MPMediaPropertyPredicateHostObject {
++    value: id,
++    property: id,
++}
++impl HostObject for MPMediaPropertyPredicateHostObject {}
++
++pub const CLASSES: ClassExports = objc_classes! {
++
++(env, this, _cmd);
++
++@implementation MPMediaPropertyPredicate: NSObject
++
+++ (id)allocWithZone:(NSZonePtr)_zone {
++    env.objc.alloc_object(
++        this,
++        Box::new(MPMediaPropertyPredicateHostObject {
++            value: nil,
++            property: nil,
++        }),
++        &mut env.mem,
++    )
++}
++
+++ (id)predicateWithValue:(id)value forProperty:(id)property {
++    let value = retain(env, value);
++    let property = retain(env, property);
++    let result = env.objc.alloc_object(
++        this,
++        Box::new(MPMediaPropertyPredicateHostObject {
++            value,
++            property,
++        }),
++        &mut env.mem,
++    );
++    autorelease(env, result)
++}
++
++- (id)value {
++    env.objc.borrow::<MPMediaPropertyPredicateHostObject>(this).value
++}
++
++- (id)property {
++    env.objc.borrow::<MPMediaPropertyPredicateHostObject>(this).property
++}
++
++- (())dealloc {
++    let state = env.objc.borrow::<MPMediaPropertyPredicateHostObject>(this);
++    let (value, property) = (state.value, state.property);
++    release(env, value);
++    release(env, property);
++    env.objc.dealloc_object(this, &mut env.mem);
++}
++
++@end
++
++};
+diff --git a/src/frameworks/media_player/media_query.rs b/src/frameworks/media_player/media_query.rs
+index a1e84ff..ca0e155 100644
+--- a/src/frameworks/media_player/media_query.rs
++++ b/src/frameworks/media_player/media_query.rs
+@@ -5,7 +5,17 @@
+  */
+ //! `MPMediaQuery`.
+ 
+-use crate::objc::{id, nil, objc_classes, ClassExports};
++use crate::frameworks::foundation::ns_array;
++use crate::objc::{
++    autorelease, id, msg, msg_class, objc_classes, release, retain, ClassExports, HostObject,
++    NSZonePtr,
++};
++
++#[derive(Default)]
++struct MPMediaQueryHostObject {
++    predicates: Vec<id>,
++}
++impl HostObject for MPMediaQueryHostObject {}
+ 
+ pub const CLASSES: ClassExports = objc_classes! {
+ 
+@@ -13,14 +23,67 @@ pub const CLASSES: ClassExports = objc_classes! {
+ 
+ @implementation MPMediaQuery: NSObject
+ 
+++ (id)allocWithZone:(NSZonePtr)_zone {
++    env.objc
++        .alloc_object(this, Box::new(MPMediaQueryHostObject::default()), &mut env.mem)
++}
++
+ + (id)playlistsQuery {
+-    log_once!("TODO: [MPMediaQuery playlistsQuery] (not implemented yet)");
+-    nil
++    let query: id = msg![env; this new];
++    autorelease(env, query)
+ }
+ 
+ + (id)songsQuery {
+-    log!("TODO: [MPMediaQuery songsQuery] (not implemented yet)");
+-    nil
++    let query: id = msg![env; this new];
++    autorelease(env, query)
++}
++
+++ (id)artistsQuery {
++    let query: id = msg![env; this new];
++    autorelease(env, query)
++}
++
++- (())addFilterPredicate:(id)predicate {
++    let already_present = env.objc.borrow::<MPMediaQueryHostObject>(this)
++        .predicates.contains(&predicate);
++    if !already_present {
++        let predicate = retain(env, predicate);
++        env.objc.borrow_mut::<MPMediaQueryHostObject>(this)
++            .predicates.push(predicate);
++    }
++}
++
++- (())removeFilterPredicate:(id)predicate {
++    let state = env.objc.borrow_mut::<MPMediaQueryHostObject>(this);
++    if let Some(index) = state.predicates.iter().position(|item| *item == predicate) {
++        let removed = state.predicates.remove(index);
++        release(env, removed);
++    }
++}
++
++- (id)filterPredicates {
++    let predicates = env.objc.borrow::<MPMediaQueryHostObject>(this).predicates.clone();
++    let predicates = predicates.into_iter().map(|item| retain(env, item)).collect();
++    let array = ns_array::from_vec(env, predicates);
++    let set: id = msg_class![env; NSSet setWithArray:array];
++    release(env, array);
++    set
++}
++
++- (id)items {
++    msg_class![env; NSArray array]
++}
++
++- (id)collections {
++    msg_class![env; NSArray array]
++}
++
++- (())dealloc {
++    let predicates = std::mem::take(&mut env.objc.borrow_mut::<MPMediaQueryHostObject>(this).predicates);
++    for predicate in predicates {
++        release(env, predicate);
++    }
++    env.objc.dealloc_object(this, &mut env.mem);
+ }
+ 
+ @end
+diff --git a/src/frameworks/media_player/movie_player.rs b/src/frameworks/media_player/movie_player.rs
+index 63a782f..584d2e7 100644
+--- a/src/frameworks/media_player/movie_player.rs
++++ b/src/frameworks/media_player/movie_player.rs
+@@ -8,17 +8,43 @@
+ use crate::dyld::{ConstantExports, HostConstant};
+ use crate::frameworks::foundation::{ns_string, ns_url, NSInteger, NSTimeInterval};
+ use crate::frameworks::uikit::ui_device::UIDeviceOrientation;
++use crate::image::Image;
+ use crate::objc::{
+     id, msg, msg_class, nil, objc_classes, release, retain, todo_objc_setter, ClassExports,
+     HostObject, NSZonePtr,
+ };
+ use crate::Environment;
+ use std::collections::VecDeque;
++use std::io::{Read, Write};
++use std::process::{Child, Command, Stdio};
++use std::sync::{mpsc, Arc};
+ use std::time::{Duration, Instant};
+ 
++// All three movies in this game's iPhone bundle use 480x320 at 30 fps.
++const VIDEO_SIZE: (u32, u32) = (480, 320);
++const FRAME_BYTES: usize = VIDEO_SIZE.0 as usize * VIDEO_SIZE.1 as usize * 4;
++
++struct Playback {
++    video: Child,
++    audio: Option<Child>,
++    frames: mpsc::Receiver<Vec<u8>>,
++}
++
++impl Playback {
++    fn stop(&mut self) {
++        let _ = self.video.kill();
++        let _ = self.video.wait();
++        if let Some(audio) = self.audio.as_mut() {
++            let _ = audio.kill();
++            let _ = audio.wait();
++        }
++    }
++}
++
+ #[derive(Default)]
+ pub struct State {
+     active_player: Option<id>,
++    playback: Option<Playback>,
+     /// Various apps (e.g. Crash Bandicoot Nitro Kart 3D and Spore Origins)
+     /// create or start a player and await some kind of notification, but can't
+     /// handle it if that notification happens immediately. This queue lets us
+@@ -32,11 +58,108 @@ impl State {
+     }
+ }
+ 
++impl Drop for State {
++    fn drop(&mut self) {
++        if let Some(mut playback) = self.playback.take() {
++            playback.stop();
++        }
++    }
++}
++
++fn feed_process(child: &mut Child, data: Arc<Vec<u8>>) {
++    let mut input = child.stdin.take().unwrap();
++    std::thread::spawn(move || {
++        let _ = input.write_all(&data);
++    });
++}
++
++fn start_video(env: &mut Environment, player: id) -> Option<Playback> {
++    let url = env
++        .objc
++        .borrow::<MPMoviePlayerControllerHostObject>(player)
++        .content_url;
++    let path = ns_url::to_rust_path(env, url);
++    let data = match env.fs.read(&path) {
++        Ok(data) => data,
++        Err(_) => {
++            log!("Movie file could not be read: {:?}", path);
++            return None;
++        }
++    };
++    let data = Arc::new(data);
++    let mut video = match Command::new("ffmpeg")
++        .args([
++            "-loglevel",
++            "error",
++            "-re",
++            "-i",
++            "pipe:0",
++            "-an",
++            "-vf",
++            "scale=480:320,fps=30",
++            "-pix_fmt",
++            "rgba",
++            "-f",
++            "rawvideo",
++            "pipe:1",
++        ])
++        .stdin(Stdio::piped())
++        .stdout(Stdio::piped())
++        .spawn()
++    {
++        Ok(child) => child,
++        Err(error) => {
++            log!("Could not start ffmpeg for {:?}: {}", path, error);
++            return None;
++        }
++    };
++    let mut output = video.stdout.take().unwrap();
++    let (sender, frames) = mpsc::sync_channel(2);
++    std::thread::spawn(move || loop {
++        let mut frame = vec![0; FRAME_BYTES];
++        if output.read_exact(&mut frame).is_err() || sender.send(frame).is_err() {
++            break;
++        }
++    });
++    feed_process(&mut video, data.clone());
++
++    let audio = match Command::new("ffplay")
++        .args([
++            "-loglevel",
++            "error",
++            "-autoexit",
++            "-nodisp",
++            "-vn",
++            "-i",
++            "pipe:0",
++        ])
++        .stdin(Stdio::piped())
++        .stdout(Stdio::null())
++        .spawn()
++    {
++        Ok(mut process) => {
++            feed_process(&mut process, data);
++            Some(process)
++        }
++        Err(error) => {
++            log!("Movie audio unavailable for {:?}: {}", path, error);
++            None
++        }
++    };
++    log!("Playing movie {:?} in the touchHLE window", path);
++    Some(Playback {
++        video,
++        audio,
++        frames,
++    })
++}
++
+ type MPMovieScalingMode = NSInteger;
+ type MPMovieControlStyle = NSInteger;
+ 
+ type MPMoviePlaybackState = NSInteger;
+ const MPMoviePlaybackStateStopped: MPMoviePlaybackState = 0;
++const MPMoviePlaybackStatePlaying: MPMoviePlaybackState = 1;
+ 
+ // Values might not be correct, but as these are linked symbol constants, it
+ // shouldn't matter.
+@@ -47,6 +170,10 @@ pub const MPMoviePlayerContentPreloadDidFinishNotification: &str =
+     "MPMoviePlayerContentPreloadDidFinishNotification";
+ pub const MPMoviePlayerScalingModeDidChangeNotification: &str =
+     "MPMoviePlayerScalingModeDidChangeNotification";
++pub const MPMoviePlayerDidExitFullscreenNotification: &str =
++    "MPMoviePlayerDidExitFullscreenNotification";
++pub const MPMoviePlayerDidEnterFullscreenNotification: &str =
++    "MPMoviePlayerDidEnterFullscreenNotification";
+ // TODO: More notifications?
+ const MPMoviePlayerPlaybackDidFinishReasonUserInfoKey: &str =
+     "MPMoviePlayerPlaybackDidFinishReasonUserInfoKey";
+@@ -65,6 +192,14 @@ pub const CONSTANTS: ConstantExports = &[
+         "_MPMoviePlayerScalingModeDidChangeNotification",
+         HostConstant::NSString(MPMoviePlayerScalingModeDidChangeNotification),
+     ),
++    (
++        "_MPMoviePlayerDidExitFullscreenNotification",
++        HostConstant::NSString(MPMoviePlayerDidExitFullscreenNotification),
++    ),
++    (
++        "_MPMoviePlayerDidEnterFullscreenNotification",
++        HostConstant::NSString(MPMoviePlayerDidEnterFullscreenNotification),
++    ),
+     (
+         "_MPMoviePlayerPlaybackDidFinishReasonUserInfoKey",
+         HostConstant::NSString(MPMoviePlayerPlaybackDidFinishReasonUserInfoKey),
+@@ -74,6 +209,7 @@ pub const CONSTANTS: ConstantExports = &[
+ struct MPMoviePlayerControllerHostObject {
+     // NSURL *
+     content_url: id,
++    fullscreen: bool,
+ }
+ impl HostObject for MPMoviePlayerControllerHostObject {}
+ 
+@@ -88,6 +224,7 @@ pub const CLASSES: ClassExports = objc_classes! {
+ + (id)allocWithZone:(NSZonePtr)_zone {
+     let host_object = Box::new(MPMoviePlayerControllerHostObject {
+         content_url: nil,
++        fullscreen: false,
+     });
+     env.objc.alloc_object(this, host_object, &mut env.mem)
+ }
+@@ -138,8 +275,26 @@ pub const CLASSES: ClassExports = objc_classes! {
+ - (())setControlStyle:(MPMovieControlStyle)style {
+     todo_objc_setter!(this, style);
+ }
+-- (())setFullscreen:(bool)fullsreen {
+-    todo_objc_setter!(this, fullsreen);
++- (())setFullscreen:(bool)fullscreen {
++    let state = env.objc.borrow_mut::<MPMoviePlayerControllerHostObject>(this);
++    if state.fullscreen == fullscreen {
++        return;
++    }
++    state.fullscreen = fullscreen;
++    let notification = if fullscreen {
++        MPMoviePlayerDidEnterFullscreenNotification
++    } else {
++        MPMoviePlayerDidExitFullscreenNotification
++    };
++    State::get(env)
++        .pending_notifications
++        .push_back((notification, this, Instant::now()));
++}
++- (())setFullscreen:(bool)fullscreen animated:(bool)_animated {
++    let _: () = msg![env; this setFullscreen:fullscreen];
++}
++- (bool)isFullscreen {
++    env.objc.borrow::<MPMoviePlayerControllerHostObject>(this).fullscreen
+ }
+ - (())setInitialPlaybackTime:(NSTimeInterval)initial_time {
+     todo_objc_setter!(this, initial_time);
+@@ -150,7 +305,17 @@ pub const CLASSES: ClassExports = objc_classes! {
+ }
+ 
+ - (MPMoviePlaybackState)playbackState {
+-    MPMoviePlaybackStateStopped // TODO
++    let state = State::get(env);
++    if state.active_player == Some(this)
++        && (state.playback.is_some()
++            || state.pending_notifications.iter().any(|(name, object, _)| {
++                *name == MPMoviePlayerPlaybackDidFinishNotification && *object == this
++            }))
++    {
++        MPMoviePlaybackStatePlaying
++    } else {
++        MPMoviePlaybackStateStopped
++    }
+ }
+ 
+ // Apparently an undocumented, private API, but Spore Origins uses it.
+@@ -167,7 +332,11 @@ pub const CLASSES: ClassExports = objc_classes! {
+ 
+ // MPMediaPlayback implementation
+ - (())play {
+-    log!("TODO: [(MPMoviePlayerController*){:?} play]", this);
++    log!(
++        "MPMoviePlayerController play: player {:?}, guest caller {:#x}",
++        this,
++        env.cpu.regs()[crate::cpu::Cpu::LR],
++    );
+     if let Some(old) = env.framework_state.media_player.movie_player.active_player {
+         let _: () = msg![env; old stop];
+     }
+@@ -176,7 +345,15 @@ pub const CLASSES: ClassExports = objc_classes! {
+     retain(env, this);
+     env.framework_state.media_player.movie_player.active_player = Some(this);
+ 
+-    // Act as if playback immediately completed after 1 second
++    if let Some(playback) = start_video(env, this) {
++        if let Some(window) = env.window.as_mut() {
++            window.set_video_touch_active(true);
++        }
++        State::get(env).playback = Some(playback);
++        return;
++    }
++
++    // Preserve the old behavior when playback is unavailable.
+     // (various apps wait for this, such as BIA and Hero of Sparta).
+     let notif = (MPMoviePlayerPlaybackDidFinishNotification, this, Instant::now().checked_add(Duration::from_millis(1000)).unwrap());
+     for (name, obj, _) in &mut State::get(env).pending_notifications {
+@@ -195,6 +372,16 @@ pub const CLASSES: ClassExports = objc_classes! {
+ 
+ - (())stop {
+     log!("TODO: [(MPMoviePlayerController*){:?} stop]", this);
++    if let Some(mut playback) = State::get(env).playback.take() {
++        playback.stop();
++    }
++    if let Some(window) = env.window.as_mut() {
++        window.set_video_frame(None);
++        window.set_video_touch_active(false);
++    }
++    State::get(env).pending_notifications.retain(|(name, object, _)| {
++        !(*name == MPMoviePlayerPlaybackDidFinishNotification && *object == this)
++    });
+     if env.framework_state.media_player.movie_player.active_player.is_some() {
+         // Some applications (like NOVA2) may send 2 `stop` messages for each
+         // 1 `play` message for the player. In that case, we want to release
+@@ -226,6 +413,70 @@ pub const CLASSES: ClassExports = objc_classes! {
+ /// For use by `NSRunLoop` via [super::handle_players]: check movie players'
+ /// status, send notifications if necessary.
+ pub(super) fn handle_players(env: &mut Environment) {
++    let skipped = env
++        .window
++        .as_mut()
++        .is_some_and(|window| window.take_video_skip_request());
++    let (latest_frame, finished) = if skipped {
++        (None, State::get(env).playback.is_some())
++    } else {
++        let mut latest_frame = None;
++        let mut frames_exhausted = false;
++        let mut finished = false;
++        if let Some(playback) = State::get(env).playback.as_mut() {
++            loop {
++                match playback.frames.try_recv() {
++                    Ok(frame) => latest_frame = Some(frame),
++                    Err(mpsc::TryRecvError::Empty) => break,
++                    Err(mpsc::TryRecvError::Disconnected) => {
++                        frames_exhausted = true;
++                        break;
++                    }
++                }
++            }
++            let video_status = playback.video.try_wait();
++            let video_done = video_status
++                .as_ref()
++                .map_or(true, |status| status.is_some());
++            let video_failed = video_status
++                .as_ref()
++                .ok()
++                .and_then(|status| status.as_ref())
++                .is_some_and(|status| !status.success());
++            let audio_done = playback.audio.as_mut().map_or(true, |audio| {
++                audio.try_wait().map_or(true, |status| status.is_some())
++            });
++            finished = video_failed || (frames_exhausted && video_done && audio_done);
++        }
++        (latest_frame, finished)
++    };
++    if let Some(frame) = latest_frame {
++        if let Some(window) = env.window.as_mut() {
++            window.set_video_frame(Some(Image::from_pixel_vec(frame, VIDEO_SIZE)));
++            window.swap_window();
++        }
++    }
++    if finished {
++        if skipped {
++            log!("Movie playback skipped by touch");
++        } else {
++            log!("Movie playback finished");
++        }
++        if let Some(mut playback) = State::get(env).playback.take() {
++            playback.stop();
++        }
++        if let Some(window) = env.window.as_mut() {
++            window.set_video_frame(None);
++            window.set_video_touch_active(false);
++        }
++        if let Some(player) = State::get(env).active_player {
++            State::get(env).pending_notifications.push_back((
++                MPMoviePlayerPlaybackDidFinishNotification,
++                player,
++                Instant::now(),
++            ));
++        }
++    }
+     let mut notifs_to_run = Vec::new();
+     let pending_notifs = &mut State::get(env).pending_notifications;
+     let mut i = 0;
+diff --git a/src/frameworks/opengles/eagl.rs b/src/frameworks/opengles/eagl.rs
+index 32a0b5c..72d764f 100644
+--- a/src/frameworks/opengles/eagl.rs
++++ b/src/frameworks/opengles/eagl.rs
+@@ -9,6 +9,7 @@ use crate::dyld::{ConstantExports, HostConstant};
+ use crate::frameworks::core_animation::ca_eagl_layer::{
+     find_fullscreen_eagl_layer, get_pixels_vec_for_presenting, present_pixels,
+ };
++use crate::frameworks::core_animation::ca_layer::fit_fullscreen_layers_to_landscape;
+ use crate::frameworks::core_graphics::{CGRect, CGSize};
+ use crate::frameworks::foundation::ns_string::get_static_str;
+ use crate::frameworks::foundation::NSUInteger;
+@@ -224,6 +225,7 @@ pub const CLASSES: ClassExports = objc_classes! {
+     }
+     let internalformat = gles11::RGBA8_OES;
+ 
++    fit_fullscreen_layers_to_landscape(env, drawable);
+     let (width, height) = {
+         let bounds: CGRect = msg![env; drawable bounds];
+         let CGSize { width, height } = bounds.size;
+@@ -302,6 +304,8 @@ pub const CLASSES: ClassExports = objc_classes! {
+         return false;
+     };
+ 
++    fit_fullscreen_layers_to_landscape(env, drawable);
++
+     // We're presenting to the opaque CAEAGLLayer that covers the screen.
+     // We can use the fast path where we skip composition and present directly.
+     if drawable == fullscreen_layer {
+@@ -549,7 +553,11 @@ unsafe fn read_renderbuffer(gles: &mut dyn GLES, mut pixel_buffer: Vec<u8>) -> (
+ unsafe fn present_renderbuffer(env: &mut Environment) {
+     // Save these for when we need to draw the frame
+     let viewport = env.window.as_mut().unwrap().viewport();
+-    let rotation_matrix = env.window.as_mut().unwrap().rotation_matrix();
++    let rotation_matrix = if env.options.landscape_content_layout {
++        crate::matrix::Matrix::identity()
++    } else {
++        env.window.as_mut().unwrap().rotation_matrix()
++    };
+     let virtual_cursor_visible_at = env.window.as_mut().unwrap().virtual_cursor_visible_at();
+ 
+     let gles_ctx = super::get_thread_context(
+@@ -749,7 +757,7 @@ unsafe fn present_renderbuffer(env: &mut Environment) {
+ 
+     // SDL2's documentation warns 0 should be bound to the draw framebuffer
+     // when swapping the window, so this is the perfect moment.
+-    env.window.as_ref().unwrap().swap_window();
++    env.window.as_mut().unwrap().swap_window();
+ 
+     let mut gles_boxed = gles_ctx.make_current(env.window.as_mut().unwrap());
+     let gles = gles_boxed.as_mut();
+diff --git a/src/frameworks/opengles/gles_guest.rs b/src/frameworks/opengles/gles_guest.rs
+index 9c86ac4..34d5278 100644
+--- a/src/frameworks/opengles/gles_guest.rs
++++ b/src/frameworks/opengles/gles_guest.rs
+@@ -824,6 +824,26 @@ fn glPopMatrix(env: &mut Environment) {
+         unsafe { gles.PopMatrix() };
+     });
+ }
++/// Align a portrait-sized orthographic projection with a landscape drawable.
++fn landscape_ortho_range(
++    left: GLfloat,
++    right: GLfloat,
++    bottom: GLfloat,
++    top: GLfloat,
++    portrait_size: (u32, u32),
++) -> (GLfloat, GLfloat, GLfloat) {
++    let (portrait_width, portrait_height) = portrait_size;
++    if left == 0.0 && right == portrait_width as f32 {
++        if bottom == portrait_height as f32 && top == 0.0 {
++            return (portrait_height as f32, portrait_width as f32, top);
++        }
++        if bottom == 0.0 && top == portrait_height as f32 {
++            return (portrait_height as f32, bottom, portrait_width as f32);
++        }
++    }
++    (right, bottom, top)
++}
++
+ fn glOrthof(
+     env: &mut Environment,
+     left: GLfloat,
+@@ -833,6 +853,22 @@ fn glOrthof(
+     near: GLfloat,
+     far: GLfloat,
+ ) {
++    let (right, bottom, top) = if env.options.landscape_content_layout
++        && matches!(
++            env.window().current_rotation(),
++            crate::window::DeviceOrientation::LandscapeLeft
++                | crate::window::DeviceOrientation::LandscapeRight
++        ) {
++        landscape_ortho_range(
++            left,
++            right,
++            bottom,
++            top,
++            env.window().device_family().portrait_size(),
++        )
++    } else {
++        (right, bottom, top)
++    };
+     with_ctx_and_mem(env, |gles, _mem| {
+         unsafe { gles.Orthof(left, right, bottom, top, near, far) };
+     });
+@@ -1656,3 +1692,32 @@ fn _get_buffer_size(env: &mut Environment, target: GLenum) -> GLint {
+         buffer_size
+     })
+ }
++
++#[cfg(test)]
++mod landscape_ortho_tests {
++    use super::landscape_ortho_range;
++
++    #[test]
++    fn landscape_projection_preserves_pixel_aspect_in_both_y_directions() {
++        for (bottom, top) in [(480.0, 0.0), (0.0, 480.0)] {
++            let (right, bottom, top) = landscape_ortho_range(0.0, 320.0, bottom, top, (320, 480));
++            assert_eq!(right, 480.0);
++            assert_eq!((bottom - top).abs(), 320.0);
++            // Both coordinate axes must have the same scale in a 480x320 drawable.
++            // Changing only Y produced a square projection and stretched X by 1.5.
++            assert_eq!(480.0 / right, 320.0 / (bottom - top).abs());
++        }
++    }
++
++    #[test]
++    fn preserves_other_projection_ranges() {
++        assert_eq!(
++            landscape_ortho_range(0.0, 480.0, 320.0, 0.0, (320, 480)),
++            (480.0, 320.0, 0.0)
++        );
++        assert_eq!(
++            landscape_ortho_range(10.0, 330.0, 480.0, 0.0, (320, 480)),
++            (330.0, 480.0, 0.0)
++        );
++    }
++}
+diff --git a/src/frameworks/uikit.rs b/src/frameworks/uikit.rs
+index c8e6773..e708e50 100644
+--- a/src/frameworks/uikit.rs
++++ b/src/frameworks/uikit.rs
+@@ -12,9 +12,11 @@
+ use crate::{msg, Environment};
+ use std::time::Instant;
+ 
++pub(crate) mod rebellion_progress;
+ pub mod ui_accelerometer;
+ pub mod ui_activity_indicator_view;
+ pub mod ui_application;
++pub mod ui_bar_button_item;
+ pub mod ui_color;
+ pub mod ui_device;
+ pub mod ui_event;
+@@ -24,6 +26,7 @@ pub mod ui_graphics;
+ pub mod ui_image;
+ pub mod ui_image_picker_controller;
+ pub mod ui_local_notification;
++pub mod ui_navigation_item;
+ pub mod ui_nib;
+ pub mod ui_pasteboard;
+ pub mod ui_responder;
+@@ -39,6 +42,7 @@ pub const DYLIB: crate::dyld::HostDylib = crate::dyld::HostDylib {
+         ui_accelerometer::CLASSES,
+         ui_activity_indicator_view::CLASSES,
+         ui_application::CLASSES,
++        ui_bar_button_item::CLASSES,
+         ui_color::CLASSES,
+         ui_device::CLASSES,
+         ui_event::CLASSES,
+@@ -47,6 +51,7 @@ pub const DYLIB: crate::dyld::HostDylib = crate::dyld::HostDylib {
+         ui_image_picker_controller::CLASSES,
+         ui_local_notification::CLASSES,
+         ui_nib::CLASSES,
++        ui_navigation_item::CLASSES,
+         ui_pasteboard::CLASSES,
+         ui_responder::CLASSES,
+         ui_screen::CLASSES,
+@@ -61,6 +66,7 @@ pub const DYLIB: crate::dyld::HostDylib = crate::dyld::HostDylib {
+         ui_view::ui_control::ui_switch::CLASSES,
+         ui_view::ui_image_view::CLASSES,
+         ui_view::ui_label::CLASSES,
++        ui_view::ui_navigation_bar::CLASSES,
+         ui_view::ui_page_control::CLASSES,
+         ui_view::ui_picker_view::CLASSES,
+         ui_view::ui_scroll_view::CLASSES,
+@@ -69,6 +75,7 @@ pub const DYLIB: crate::dyld::HostDylib = crate::dyld::HostDylib {
+         ui_view::ui_window::CLASSES,
+         ui_view_controller::CLASSES,
+         ui_view_controller::ui_navigation_controller::CLASSES,
++        ui_view_controller::ui_table_view_controller::CLASSES,
+     ],
+     constant_exports: &[
+         ui_application::CONSTANTS,
+@@ -85,6 +92,7 @@ pub const DYLIB: crate::dyld::HostDylib = crate::dyld::HostDylib {
+ 
+ #[derive(Default)]
+ pub struct State {
++    rebellion_posters: Option<(u32, Vec<i32>)>,
+     ui_accelerometer: ui_accelerometer::State,
+     ui_application: ui_application::State,
+     ui_color: ui_color::State,
+@@ -116,6 +124,8 @@ pub fn handle_events(env: &mut Environment) -> Option<Instant> {
+             Event::TouchesDown(..) | Event::TouchesMove(..) | Event::TouchesUp(..) => {
+                 ui_touch::handle_event(env, event)
+             }
++            Event::ActivateDoor => activate_8bit_rebellion_door(env),
++            Event::ToggleGameMenu => toggle_8bit_rebellion_menu(env),
+             Event::AppWillResignActive => {
+                 // Getting this event means touchHLE is becoming inactive, e.g.
+                 // due to switching apps. The obvious way to handle this would
+@@ -169,5 +179,212 @@ pub fn handle_events(env: &mut Environment) -> Option<Instant> {
+         }
+     }
+ 
++    sync_8bit_rebellion_walk_direction(env);
++    rebellion_progress::sync_posters(env);
+     ui_accelerometer::handle_accelerometer(env)
+ }
++
++/// Follow DoorEntryComponent's own completed-button path, without relying on
++/// the on-screen icon's moving position. The field offsets are from the
++/// Objective-C metadata in the user-supplied 1.4.5 executable.
++fn activate_8bit_rebellion_door(env: &mut Environment) {
++    use crate::frameworks::core_graphics::CGPoint;
++    use crate::objc::id;
++
++    if env.bundle.bundle_identifier() != "com.alife.linkinpark"
++        || env.bundle.bundle_version() != "1.4.5"
++    {
++        return;
++    }
++    let Some(class) = env
++        .objc
++        .all_classes()
++        .find(|(name, _)| name.as_str() == "DoorEntryComponent")
++        .map(|(_, &class)| class)
++    else {
++        return;
++    };
++    let candidates = env.objc.instances_of_class(class, &env.mem);
++    let active: Vec<_> = candidates
++        .into_iter()
++        .filter_map(|component| {
++            let base = component.cast::<u8>();
++            let state: i32 = env.mem.read((base + 48).cast());
++            let door_index: i32 = env.mem.read((base + 64).cast());
++            let door_pos: CGPoint = env.mem.read((base + 68).cast());
++            let delegate: id = env.mem.read((base + 80).cast());
++            ((state == 2 || state == 3) && door_index >= 0 && !delegate.is_null())
++                .then_some((delegate, door_index, door_pos))
++        })
++        .collect();
++    if let [(delegate, door_index, door_pos)] = active.as_slice() {
++        let (delegate, door_index, door_pos) = (*delegate, *door_index, *door_pos);
++        log!("Keyboard activating visible door {}", door_index);
++        let _: () = msg![env; delegate enterDoor:door_index Position:door_pos];
++    }
++}
++
++fn toggle_8bit_rebellion_menu(env: &mut Environment) {
++    if env.bundle.bundle_identifier() != "com.alife.linkinpark"
++        || env.bundle.bundle_version() != "1.4.5"
++    {
++        return;
++    }
++    let Some(class) = env
++        .objc
++        .all_classes()
++        .find(|(name, _)| name.as_str() == "SceneUIMenuBar")
++        .map(|(_, &class)| class)
++    else {
++        return;
++    };
++    let menus = env.objc.instances_of_class(class, &env.mem);
++    if let [menu] = menus.as_slice() {
++        let menu = *menu;
++        log!("Keyboard toggling side menu");
++        let _: () = msg![env; menu nextMode];
++    }
++}
++
++/// The guest's moveLeft/RightShouldRun: only accept states 0, 1, 2 and 20.
++/// During an attack the component sets isWalkHold, but direction cannot change.
++/// Its next cycle then chooses movement from the old facing direction. Ending
++/// the attack touch also clears isWalkHold despite the direction still being held.
++fn needs_walk_direction_retry(
++    state: i32,
++    facing_right: bool,
++    held_right: bool,
++    holding: bool,
++) -> bool {
++    matches!(state, 0 | 1 | 2 | 20) && (!holding || facing_right != held_right)
++}
++
++fn sync_8bit_rebellion_walk_direction(env: &mut Environment) {
++    use crate::objc::{id, nil, ObjC};
++    use crate::options::Button;
++
++    if env.bundle.bundle_identifier() != "com.alife.linkinpark"
++        || env.bundle.bundle_version() != "1.4.5"
++    {
++        return;
++    }
++    let held_right = match env.window().held_keyboard_direction() {
++        Some(Button::DPadRight) => true,
++        Some(Button::DPadLeft) => false,
++        _ => return,
++    };
++    let Some(view) = ui_touch::keyboard_direction_view(env) else {
++        return;
++    };
++    if env.objc.get_class_name(ObjC::read_isa(view, &env.mem)) != "GCEAGLView" {
++        return;
++    }
++    let Some(class) = env
++        .objc
++        .all_classes()
++        .find(|(name, _)| name.as_str() == "AvatarComponent")
++        .map(|(_, &class)| class)
++    else {
++        return;
++    };
++    let components = env.objc.instances_of_class(class, &env.mem);
++    let [component] = components.as_slice() else {
++        return;
++    };
++    // Offsets from the Objective-C metadata in the local 1.4.5 executable.
++    let base = component.cast::<u8>();
++    let holding: i8 = env.mem.read((base + 88).cast());
++    let player: id = env.mem.read((base + 60).cast());
++    if player == nil {
++        return;
++    }
++    let state: i32 = msg![env; player m_state];
++    let facing_right: bool = msg![env; player isFaceRight];
++    if !needs_walk_direction_retry(state, facing_right, held_right, holding != 0) {
++        return;
++    }
++    let running: i8 = env.mem.read((base + 89).cast());
++    if held_right {
++        let _: () = msg![env; player moveRightShouldRun:running];
++    } else {
++        let _: () = msg![env; player moveLeftShouldRun:running];
++    }
++    let now_right: bool = msg![env; player isFaceRight];
++    let next_state: i32 = msg![env; player m_state];
++    if now_right == held_right && matches!(next_state, 1 | 2) {
++        // touchesEnded: for the attack also clears isWalkHold. Restore it only
++        // after the game's own movement method actually accepted the input.
++        env.mem.write((base + 88).cast::<i8>(), 1);
++
++        log!(
++            "8-Bit Rebellion restored held movement after attack: state={}, right={}",
++            state,
++            now_right
++        );
++    }
++}
++
++#[cfg(test)]
++mod rebellion_walk_tests {
++    use super::needs_walk_direction_retry;
++
++    #[test]
++    fn held_reverse_direction_waits_for_movement_state_in_both_directions() {
++        for facing_right in [false, true] {
++            for state in -1..=27 {
++                let movable = matches!(state, 0 | 1 | 2 | 20);
++                assert_eq!(
++                    needs_walk_direction_retry(state, facing_right, !facing_right, true),
++                    movable
++                );
++                assert!(!needs_walk_direction_retry(
++                    state,
++                    facing_right,
++                    facing_right,
++                    true
++                ));
++                assert_eq!(
++                    needs_walk_direction_retry(state, facing_right, facing_right, false),
++                    movable
++                );
++            }
++        }
++    }
++}
++
++/// MapComponent's assign delegate can be destroyed by selectLocation: while
++/// touch dispatch still traverses the map buttons. Keep it alive for this
++/// event, and clear a dangling delegate before a second click is delivered.
++fn retain_8bit_rebellion_map_delegate(env: &mut Environment) -> crate::objc::id {
++    use crate::objc::{id, nil, retain};
++    if env.bundle.bundle_identifier() != "com.alife.linkinpark"
++        || env.bundle.bundle_version() != "1.4.5"
++    {
++        return nil;
++    }
++    let Some(class) = env
++        .objc
++        .all_classes()
++        .find(|(name, _)| name.as_str() == "MapComponent")
++        .map(|(_, &class)| class)
++    else {
++        return nil;
++    };
++    let maps = env.objc.instances_of_class(class, &env.mem);
++    let [map] = maps.as_slice() else {
++        return nil;
++    };
++    // MapComponent.delegate is an assign field at offset 132 in IPA 1.4.5.
++    let field = (map.cast::<u8>() + 132).cast::<id>();
++    let delegate: id = env.mem.read(field);
++    if delegate == nil {
++        return nil;
++    }
++    if env.objc.get_host_object(delegate).is_none() {
++        env.mem.write(field, nil);
++        log!("8-Bit Rebellion cleared expired map delegate before repeated touch");
++        return nil;
++    }
++    retain(env, delegate);
++    delegate
++}
+diff --git a/src/frameworks/uikit/rebellion_progress.rs b/src/frameworks/uikit/rebellion_progress.rs
+new file mode 100644
+index 0000000..4f3d1d7
+--- /dev/null
++++ b/src/frameworks/uikit/rebellion_progress.rs
+@@ -0,0 +1,248 @@
++// This game keeps its defaced-poster IDs only in a C++ vector. Its SQLite
++// mission_state is a quest stage, and mission_data is not populated for them.
++// Preserve that vector in the application's own Documents directory so both
++// the objective counter and ScenePoster's appearance survive a restart.
++use crate::mem::{ConstPtr, Ptr};
++use crate::{msg, Environment};
++use std::io::Cursor;
++
++const MAGIC: &[u8; 4] = b"8BP1";
++const MAX_POSTERS: usize = 20;
++
++fn write_atomically(fs: &mut crate::fs::Fs, path: &crate::fs::GuestPath, bytes: &[u8]) -> bool {
++    let temporary_name = format!("{}.tmp", path.as_str());
++    let temporary = crate::fs::GuestPath::new(&temporary_name);
++    fs.write(temporary, bytes).is_ok() && fs.rename(temporary, path).is_ok()
++}
++
++// The game writes 1 when a tutorial is first displayed and 2 only after its
++// guided completion callback. At the next launch its loadState turns every 1
++// back into 0, causing the same popup to return. For this offline campaign,
++// a displayed tutorial should be remembered across sessions.
++fn completed_tutorial_plist(bytes: &[u8]) -> Option<Vec<u8>> {
++    let mut value = plist::Value::from_reader(Cursor::new(bytes)).ok()?;
++    let states = value.as_array_mut()?;
++    if states.len() != 45
++        || !states
++            .iter()
++            .all(|v| matches!(v.as_signed_integer(), Some(0..=2)))
++    {
++        return None;
++    }
++    let mut changed = false;
++    for state in states {
++        if state.as_signed_integer() == Some(1) {
++            *state = plist::Value::Integer(2.into());
++            changed = true;
++        }
++    }
++    if !changed {
++        return None;
++    }
++    let mut out = Vec::new();
++    value.to_writer_binary(&mut out).ok()?;
++    Some(out)
++}
++
++pub(crate) fn finish_previously_shown_tutorials(fs: &mut crate::fs::Fs) {
++    let path = fs.home_directory().join("Documents/Player_Tutorial");
++    if let Ok(bytes) = fs.read(&path) {
++        if let Some(completed) = completed_tutorial_plist(&bytes) {
++            if write_atomically(fs, &path, &completed) {
++                log!("Preserved previously displayed 8-Bit Rebellion tutorials");
++            }
++        }
++    }
++}
++
++fn decode(bytes: &[u8]) -> Option<Vec<i32>> {
++    if bytes.len() < 5 || &bytes[..4] != MAGIC {
++        return None;
++    }
++    let count = bytes[4] as usize;
++    if count > MAX_POSTERS || bytes.len() != 5 + 4 * count {
++        return None;
++    }
++    let mut ids = Vec::with_capacity(count);
++    for chunk in bytes[5..].chunks_exact(4) {
++        let id = i32::from_le_bytes(chunk.try_into().unwrap());
++        if id < 0 || ids.contains(&id) {
++            return None;
++        }
++        ids.push(id);
++    }
++    Some(ids)
++}
++
++fn encode(ids: &[i32]) -> Vec<u8> {
++    let mut bytes = Vec::with_capacity(5 + 4 * ids.len());
++    bytes.extend_from_slice(MAGIC);
++    bytes.push(ids.len() as u8);
++    for id in ids {
++        bytes.extend_from_slice(&id.to_le_bytes());
++    }
++    bytes
++}
++
++fn merge_poster_ids(saved: &mut Vec<i32>, current: &[i32]) -> Vec<i32> {
++    for id in current {
++        if !saved.contains(id) {
++            saved.push(*id);
++        }
++    }
++    saved
++        .iter()
++        .copied()
++        .filter(|id| !current.contains(id))
++        .collect()
++}
++
++fn poster_ids(env: &Environment, mission: crate::objc::id) -> Option<Vec<i32>> {
++    let ivar = env
++        .objc
++        .object_lookup_ivar(&env.mem, mission, &"defacedPosterList".to_owned())?;
++    let vector: u32 = env.mem.read(ivar);
++    if vector == 0
++        || env
++            .mem
++            .get_bytes_fallible(Ptr::from_bits(vector), 12)
++            .is_none()
++    {
++        return None;
++    }
++    let begin: u32 = env.mem.read(ConstPtr::from_bits(vector));
++    let end: u32 = env.mem.read(ConstPtr::from_bits(vector + 4));
++    let capacity: u32 = env.mem.read(ConstPtr::from_bits(vector + 8));
++    if begin > end || end > capacity || (end - begin) % 4 != 0 {
++        return None;
++    }
++    let count = ((end - begin) / 4) as usize;
++    if count > MAX_POSTERS
++        || (count > 0
++            && env
++                .mem
++                .get_bytes_fallible(Ptr::from_bits(begin), end - begin)
++                .is_none())
++    {
++        return None;
++    }
++    let ids: Vec<i32> = (0..count)
++        .map(|i| env.mem.read(ConstPtr::from_bits(begin + 4 * i as u32)))
++        .collect();
++    (ids.iter().all(|&id| id >= 0) && ids.iter().enumerate().all(|(i, id)| !ids[..i].contains(id)))
++        .then_some(ids)
++}
++
++pub(super) fn sync_posters(env: &mut Environment) {
++    if env.bundle.bundle_identifier() != "com.alife.linkinpark"
++        || env.bundle.bundle_version() != "1.4.5"
++    {
++        return;
++    }
++    let Some(class) = env
++        .objc
++        .all_classes()
++        .find(|(name, _)| name.as_str() == "LPMission1")
++        .map(|(_, &class)| class)
++    else {
++        return;
++    };
++    let instances = env.objc.instances_of_class(class, &env.mem);
++    let [mission] = instances.as_slice() else {
++        env.framework_state.uikit.rebellion_posters = None;
++        return;
++    };
++    let mission = *mission;
++    let Some(ids) = poster_ids(env, mission) else {
++        return;
++    };
++    let path = env
++        .fs
++        .home_directory()
++        .join("Documents/8beet-poster-progress-v1");
++    let first_seen = env
++        .framework_state
++        .uikit
++        .rebellion_posters
++        .as_ref()
++        .map(|(ptr, _)| *ptr)
++        != Some(mission.to_bits());
++    let mut saved = if first_seen {
++        env.fs
++            .read(&path)
++            .ok()
++            .and_then(|bytes| decode(&bytes))
++            .unwrap_or_default()
++    } else {
++        env.framework_state
++            .uikit
++            .rebellion_posters
++            .as_ref()
++            .unwrap()
++            .1
++            .clone()
++    };
++    let original_count = saved.len();
++    let missing = merge_poster_ids(&mut saved, &ids);
++    if saved.len() > MAX_POSTERS {
++        log!(
++            "Ignoring invalid 8-Bit Rebellion poster count {}",
++            saved.len()
++        );
++        return;
++    }
++    if !missing.is_empty() {
++        for id in missing {
++            let _: () = msg![env; mission defacePoster:id];
++        }
++        log!("Restored {} 8-Bit Rebellion posters", saved.len());
++    }
++    // A new mission object may reuse the same guest pointer. Its empty vector
++    // is temporary, not a request to erase progress. Poster collection only
++    // grows within this quest; save the union, never a smaller list.
++    if saved.len() > original_count || (first_seen && !saved.is_empty() && !env.fs.exists(&path)) {
++        if write_atomically(&mut env.fs, &path, &encode(&saved)) {
++            log!("Saved {} 8-Bit Rebellion posters", saved.len());
++        }
++    }
++    env.framework_state.uikit.rebellion_posters = Some((mission.to_bits(), saved));
++}
++
++#[cfg(test)]
++mod tests {
++    use super::{completed_tutorial_plist, decode, encode, merge_poster_ids};
++
++    #[test]
++    fn poster_progress_round_trip_and_rejects_corruption() {
++        let ids = [3, 8, 12];
++        assert_eq!(decode(&encode(&ids)), Some(ids.to_vec()));
++        assert_eq!(decode(&encode(&[3, 3])), None);
++        assert_eq!(decode(&encode(&ids)[..6]), None);
++    }
++
++    #[test]
++    fn an_empty_new_mission_does_not_erase_collected_posters() {
++        let mut saved = vec![3, 8];
++        assert_eq!(merge_poster_ids(&mut saved, &[]), vec![3, 8]);
++        assert_eq!(saved, vec![3, 8]);
++        assert_eq!(merge_poster_ids(&mut saved, &[3, 8, 12]), Vec::<i32>::new());
++        assert_eq!(saved, vec![3, 8, 12]);
++    }
++
++    #[test]
++    fn displayed_tutorials_are_marked_complete_without_touching_other_states() {
++        let mut states = vec![plist::Value::Integer(0.into()); 45];
++        states[1] = plist::Value::Integer(1.into());
++        states[2] = plist::Value::Integer(2.into());
++        let mut bytes = Vec::new();
++        plist::Value::Array(states)
++            .to_writer_binary(&mut bytes)
++            .unwrap();
++        let updated = completed_tutorial_plist(&bytes).unwrap();
++        let parsed = plist::Value::from_reader(std::io::Cursor::new(updated)).unwrap();
++        let values = parsed.as_array().unwrap();
++        assert_eq!(values[0].as_signed_integer(), Some(0));
++        assert_eq!(values[1].as_signed_integer(), Some(2));
++        assert_eq!(values[2].as_signed_integer(), Some(2));
++    }
++}
+diff --git a/src/frameworks/uikit/ui_activity_indicator_view.rs b/src/frameworks/uikit/ui_activity_indicator_view.rs
+index 7384f20..d9d899a 100644
+--- a/src/frameworks/uikit/ui_activity_indicator_view.rs
++++ b/src/frameworks/uikit/ui_activity_indicator_view.rs
+@@ -5,10 +5,11 @@
+  */
+ //! `UIActivityIndicatorView`.
+ 
++use crate::frameworks::core_graphics::CGRect;
+ use crate::frameworks::foundation::NSInteger;
+ use crate::objc::{
+-    id, impl_HostObject_with_superclass, msg, objc_classes, todo_objc_setter, ClassExports,
+-    NSZonePtr,
++    id, impl_HostObject_with_superclass, msg, msg_super, objc_classes, todo_objc_setter,
++    ClassExports, NSZonePtr,
+ };
+ 
+ type UIActivityIndicatorViewStyle = NSInteger;
+@@ -16,6 +17,7 @@ type UIActivityIndicatorViewStyle = NSInteger;
+ pub struct UIActivityIndicatorViewHostObject {
+     superclass: super::ui_view::UIViewHostObject,
+     animating: bool,
++    hides_when_stopped: bool,
+ }
+ impl_HostObject_with_superclass!(UIActivityIndicatorViewHostObject);
+ 
+@@ -29,6 +31,7 @@ pub const CLASSES: ClassExports = objc_classes! {
+     let host_object = Box::new(UIActivityIndicatorViewHostObject {
+         superclass: Default::default(),
+         animating: false,
++        hides_when_stopped: true,
+     });
+     env.objc.alloc_object(this, host_object, &mut env.mem)
+ }
+@@ -38,6 +41,18 @@ pub const CLASSES: ClassExports = objc_classes! {
+     msg![env; this init]
+ }
+ 
++- (id)initWithFrame:(CGRect)frame {
++    let this: id = msg_super![env; this initWithFrame:frame];
++    () = msg![env; this setHidden:true];
++    this
++}
++
++- (id)initWithCoder:(id)coder {
++    let this: id = msg_super![env; this initWithCoder:coder];
++    () = msg![env; this setHidden:true];
++    this
++}
++
+ - (())setActivityIndicatorViewStyle:(UIActivityIndicatorViewStyle)style {
+     todo_objc_setter!(this, style);
+ }
+@@ -45,18 +60,35 @@ pub const CLASSES: ClassExports = objc_classes! {
+ - (())startAnimating {
+     log!("TODO: [(UIActivityIndicatorView *){:?} startAnimating]", this);
+     env.objc.borrow_mut::<UIActivityIndicatorViewHostObject>(this).animating = true;
++    if env.objc.borrow::<UIActivityIndicatorViewHostObject>(this).hides_when_stopped {
++        () = msg![env; this setHidden:false];
++    }
+ }
+ - (())stopAnimating {
+     log!("TODO: [(UIActivityIndicatorView *){:?} stopAnimating]", this);
+     env.objc.borrow_mut::<UIActivityIndicatorViewHostObject>(this).animating = false;
++    if env.objc.borrow::<UIActivityIndicatorViewHostObject>(this).hides_when_stopped {
++        () = msg![env; this setHidden:true];
++    }
+ }
+ 
+ - (bool)isAnimating {
+     env.objc.borrow::<UIActivityIndicatorViewHostObject>(this).animating
+ }
+ 
+-- (())setHidesWhenStopped:(bool)_hides {
+-    // TODO
++- (bool)hidesWhenStopped {
++    env.objc.borrow::<UIActivityIndicatorViewHostObject>(this).hides_when_stopped
++}
++
++- (())setHidesWhenStopped:(bool)hides {
++    let animating = {
++        let host = env.objc.borrow_mut::<UIActivityIndicatorViewHostObject>(this);
++        host.hides_when_stopped = hides;
++        host.animating
++    };
++    if !animating {
++        () = msg![env; this setHidden:hides];
++    }
+ }
+ 
+ @end
+diff --git a/src/frameworks/uikit/ui_bar_button_item.rs b/src/frameworks/uikit/ui_bar_button_item.rs
+new file mode 100644
+index 0000000..3b8f074
+--- /dev/null
++++ b/src/frameworks/uikit/ui_bar_button_item.rs
+@@ -0,0 +1,87 @@
++/*
++ * This Source Code Form is subject to the terms of the Mozilla Public
++ * License, v. 2.0. If a copy of the MPL was not distributed with this
++ * file, You can obtain one at https://mozilla.org/MPL/2.0/.
++ */
++//! `UIBarItem` and `UIBarButtonItem`.
++
++use crate::frameworks::foundation::NSInteger;
++use crate::objc::{
++    id, impl_HostObject_with_superclass, nil, objc_classes, release, retain, ClassExports,
++    HostObject, NSZonePtr, SEL,
++};
++
++#[derive(Default)]
++struct UIBarItemHostObject {
++    title: id,
++}
++impl HostObject for UIBarItemHostObject {}
++
++#[derive(Default)]
++struct UIBarButtonItemHostObject {
++    superclass: UIBarItemHostObject,
++    style: NSInteger,
++    target: id, // weak
++    action: Option<SEL>,
++}
++impl_HostObject_with_superclass!(UIBarButtonItemHostObject);
++
++pub const CLASSES: ClassExports = objc_classes! {
++
++(env, this, _cmd);
++
++@implementation UIBarItem: NSObject
++
+++ (id)allocWithZone:(NSZonePtr)_zone {
++    let host_object = Box::<UIBarItemHostObject>::default();
++    env.objc.alloc_object(this, host_object, &mut env.mem)
++}
++
++- (id)title {
++    env.objc.borrow::<UIBarItemHostObject>(this).title
++}
++
++- (())setTitle:(id)title {
++    retain(env, title);
++    let old = std::mem::replace(&mut env.objc.borrow_mut::<UIBarItemHostObject>(this).title, title);
++    release(env, old);
++}
++
++- (())dealloc {
++    let title = std::mem::replace(&mut env.objc.borrow_mut::<UIBarItemHostObject>(this).title, nil);
++    release(env, title);
++    env.objc.dealloc_object(this, &mut env.mem)
++}
++
++@end
++
++@implementation UIBarButtonItem: UIBarItem
++
+++ (id)allocWithZone:(NSZonePtr)_zone {
++    let host_object = Box::<UIBarButtonItemHostObject>::default();
++    env.objc.alloc_object(this, host_object, &mut env.mem)
++}
++
++- (id)initWithTitle:(id)title
++             style:(NSInteger)style
++            target:(id)target
++            action:(SEL)action {
++    () = crate::msg![env; this setTitle:title];
++    let host_object = env.objc.borrow_mut::<UIBarButtonItemHostObject>(this);
++    host_object.style = style;
++    host_object.target = target;
++    host_object.action = Some(action);
++    this
++}
++
++- (id)target {
++    env.objc.borrow::<UIBarButtonItemHostObject>(this).target
++}
++
++- (())setTarget:(id)target {
++    env.objc.borrow_mut::<UIBarButtonItemHostObject>(this).target = target;
++}
++
++@end
++
++};
+diff --git a/src/frameworks/uikit/ui_navigation_item.rs b/src/frameworks/uikit/ui_navigation_item.rs
+new file mode 100644
+index 0000000..25c35d2
+--- /dev/null
++++ b/src/frameworks/uikit/ui_navigation_item.rs
+@@ -0,0 +1,83 @@
++/*
++ * This Source Code Form is subject to the terms of the Mozilla Public
++ * License, v. 2.0. If a copy of the MPL was not distributed with this
++ * file, You can obtain one at https://mozilla.org/MPL/2.0/.
++ */
++//! `UINavigationItem`.
++
++use crate::objc::{id, nil, objc_classes, release, retain, ClassExports, HostObject, NSZonePtr};
++
++#[derive(Default)]
++struct UINavigationItemHostObject {
++    title: id,
++    left_bar_button_item: id,
++    right_bar_button_item: id,
++}
++impl HostObject for UINavigationItemHostObject {}
++
++pub const CLASSES: ClassExports = objc_classes! {
++
++(env, this, _cmd);
++
++@implementation UINavigationItem: NSObject
++
+++ (id)allocWithZone:(NSZonePtr)_zone {
++    let host_object = Box::<UINavigationItemHostObject>::default();
++    env.objc.alloc_object(this, host_object, &mut env.mem)
++}
++
++- (id)initWithTitle:(id)title {
++    retain(env, title);
++    env.objc.borrow_mut::<UINavigationItemHostObject>(this).title = title;
++    this
++}
++
++- (id)initWithCoder:(id)_coder {
++    // TODO: Decode archived navigation item properties.
++    this
++}
++
++- (id)title {
++    env.objc.borrow::<UINavigationItemHostObject>(this).title
++}
++
++- (())setTitle:(id)title {
++    retain(env, title);
++    let old = std::mem::replace(&mut env.objc.borrow_mut::<UINavigationItemHostObject>(this).title, title);
++    release(env, old);
++}
++
++- (id)leftBarButtonItem {
++    env.objc.borrow::<UINavigationItemHostObject>(this).left_bar_button_item
++}
++
++- (())setLeftBarButtonItem:(id)item {
++    retain(env, item);
++    let old = std::mem::replace(&mut env.objc.borrow_mut::<UINavigationItemHostObject>(this).left_bar_button_item, item);
++    release(env, old);
++}
++
++- (id)rightBarButtonItem {
++    env.objc.borrow::<UINavigationItemHostObject>(this).right_bar_button_item
++}
++
++- (())setRightBarButtonItem:(id)item {
++    retain(env, item);
++    let old = std::mem::replace(&mut env.objc.borrow_mut::<UINavigationItemHostObject>(this).right_bar_button_item, item);
++    release(env, old);
++}
++
++- (())dealloc {
++    let host_object = env.objc.borrow_mut::<UINavigationItemHostObject>(this);
++    let title = std::mem::replace(&mut host_object.title, nil);
++    let left = std::mem::replace(&mut host_object.left_bar_button_item, nil);
++    let right = std::mem::replace(&mut host_object.right_bar_button_item, nil);
++    release(env, title);
++    release(env, left);
++    release(env, right);
++    env.objc.dealloc_object(this, &mut env.mem)
++}
++
++@end
++
++};
+diff --git a/src/frameworks/uikit/ui_screen.rs b/src/frameworks/uikit/ui_screen.rs
+index 840d763..a1330e3 100644
+--- a/src/frameworks/uikit/ui_screen.rs
++++ b/src/frameworks/uikit/ui_screen.rs
+@@ -51,7 +51,12 @@ pub const CLASSES: ClassExports = objc_classes! {
+     // While Apple's documentation says this changes with the interface
+     // orientation, https://useyourloaf.com/blog/uiscreen-bounds-in-ios-8/ says
+     // ths wasn't the case prior to iOS 8.
+-    let (width, height) = env.window().device_family().portrait_size();
++    let (mut width, mut height) = env.window().device_family().portrait_size();
++    if env.options.landscape_content_layout
++        && matches!(env.window().current_rotation(), crate::window::DeviceOrientation::LandscapeLeft | crate::window::DeviceOrientation::LandscapeRight)
++    {
++        (width, height) = (height, width);
++    }
+     CGRect {
+         origin: CGPoint { x: 0.0, y: 0.0 },
+         size: CGSize { width: width as f32, height: height as f32 },
+diff --git a/src/frameworks/uikit/ui_touch.rs b/src/frameworks/uikit/ui_touch.rs
+index 1461475..5d662e0 100644
+--- a/src/frameworks/uikit/ui_touch.rs
++++ b/src/frameworks/uikit/ui_touch.rs
+@@ -108,8 +108,21 @@ pub const CLASSES: ClassExports = objc_classes! {
+ 
+ };
+ 
++/// Only an accepted direction touch should drive game-specific compatibility.
++pub(super) fn keyboard_direction_view(env: &Environment) -> Option<id> {
++    let touch = *env
++        .framework_state
++        .uikit
++        .ui_touch
++        .current_touches
++        .get(&FingerId::KeyboardDirection)?;
++    let view = env.objc.borrow::<UITouchHostObject>(touch).view;
++    (view != nil).then_some(view)
++}
++
+ /// [super::handle_events] will forward touch events to this function.
+ pub fn handle_event(env: &mut Environment, event: Event) {
++    let map_delegate = super::retain_8bit_rebellion_map_delegate(env);
+     // before processing anything, we mark all current touches as stationary
+     let current_touches = &env.framework_state.uikit.ui_touch.current_touches;
+     for &touch in (*current_touches).values() {
+@@ -121,9 +134,16 @@ pub fn handle_event(env: &mut Environment, event: Event) {
+         Event::TouchesUp(map) => handle_touches_up(env, map),
+         _ => unreachable!(),
+     }
++    release(env, map_delegate);
+ }
+ 
+ fn handle_touches_down(env: &mut Environment, map: HashMap<FingerId, Coords>) {
++    let keyboard_touch = map.keys().any(|finger| {
++        matches!(
++            finger,
++            FingerId::KeyboardDirection | FingerId::KeyboardAttack
++        )
++    });
+     // UIKit creates and drains autorelease pools when handling events.
+     let pool: id = msg_class![env; NSAutoreleasePool new];
+ 
+@@ -258,6 +278,15 @@ fn handle_touches_down(env: &mut Environment, map: HashMap<FingerId, Coords>) {
+         }
+ 
+         let is_multi_touch_enabled: bool = msg![env; view isMultipleTouchEnabled];
++        if keyboard_touch {
++            log!(
++                "8-Bit Rebellion keyboard touch: view={:?}, class={}, multi_touch={}, existing_touch={}",
++                view,
++                env.objc.get_class_name(crate::objc::ObjC::read_isa(view, &env.mem)),
++                is_multi_touch_enabled,
++                views_with_existing_touches.contains(&view),
++            );
++        }
+         if !is_multi_touch_enabled {
+             // When a view has multi-touch disabled, it can only have one active
+             // touch at once. So, we can only report a new touch to the view if
+diff --git a/src/frameworks/uikit/ui_view.rs b/src/frameworks/uikit/ui_view.rs
+index b4dc3af..ff2ab1b 100644
+--- a/src/frameworks/uikit/ui_view.rs
++++ b/src/frameworks/uikit/ui_view.rs
+@@ -12,6 +12,7 @@ pub mod ui_alert_view;
+ pub mod ui_control;
+ pub mod ui_image_view;
+ pub mod ui_label;
++pub mod ui_navigation_bar;
+ pub mod ui_page_control;
+ pub mod ui_picker_view;
+ pub mod ui_scroll_view;
+@@ -87,6 +88,7 @@ pub(super) struct UIViewHostObject {
+     clears_context_before_drawing: bool,
+     user_interaction_enabled: bool,
+     multiple_touch_enabled: bool,
++    needs_layout: bool,
+ }
+ impl HostObject for UIViewHostObject {}
+ impl Default for UIViewHostObject {
+@@ -102,6 +104,7 @@ impl Default for UIViewHostObject {
+             clears_context_before_drawing: true,
+             user_interaction_enabled: true,
+             multiple_touch_enabled: false,
++            needs_layout: false,
+         }
+     }
+ }
+@@ -124,6 +127,20 @@ pub fn set_view_controller(env: &mut Environment, view: id, controller: id) {
+     host_obj.view_controller = controller;
+ }
+ 
++/// Process requests coalesced by `setNeedsLayout` on the main run loop.
++pub fn layout_pending_views(env: &mut Environment) {
++    let views = env.framework_state.uikit.ui_view.views.clone();
++    for view in views {
++        // Layout can remove another view from this non-retaining list.
++        if !env.framework_state.uikit.ui_view.views.contains(&view) {
++            continue;
++        }
++        if env.objc.borrow::<UIViewHostObject>(view).needs_layout {
++            () = msg![env; view layoutIfNeeded];
++        }
++    }
++}
++
+ /// Shared parts of `initWithCoder:` and `initWithFrame:`. These can't call
+ /// `init`: the subclass may have overridden `init` and will not expect to be
+ /// called here.
+@@ -448,6 +465,27 @@ pub const CLASSES: ClassExports = objc_classes! {
+     // nothing.
+ }
+ 
++- (())setNeedsLayout {
++    env.objc.borrow_mut::<UIViewHostObject>(this).needs_layout = true;
++}
++
++- (())layoutIfNeeded {
++    let (needs_layout, subviews) = {
++        let host = env.objc.borrow_mut::<UIViewHostObject>(this);
++        (std::mem::take(&mut host.needs_layout), host.subviews.clone())
++    };
++    for &subview in &subviews {
++        retain(env, subview);
++    }
++    if needs_layout {
++        () = msg![env; this layoutSubviews];
++    }
++    for subview in subviews {
++        () = msg![env; subview layoutIfNeeded];
++        release(env, subview);
++    }
++}
++
+ - (id)superview {
+     env.objc.borrow::<UIViewHostObject>(this).superview
+ }
+@@ -625,6 +663,7 @@ pub const CLASSES: ClassExports = objc_classes! {
+         clears_context_before_drawing: _,
+         user_interaction_enabled: _,
+         multiple_touch_enabled: _,
++        needs_layout: _,
+     } = std::mem::take(env.objc.borrow_mut(this));
+ 
+     release(env, layer);
+diff --git a/src/frameworks/uikit/ui_view/ui_navigation_bar.rs b/src/frameworks/uikit/ui_view/ui_navigation_bar.rs
+new file mode 100644
+index 0000000..8254d08
+--- /dev/null
++++ b/src/frameworks/uikit/ui_view/ui_navigation_bar.rs
+@@ -0,0 +1,66 @@
++/*
++ * This Source Code Form is subject to the terms of the Mozilla Public
++ * License, v. 2.0. If a copy of the MPL was not distributed with this
++ * file, You can obtain one at https://mozilla.org/MPL/2.0/.
++ */
++//! `UINavigationBar`.
++
++use crate::frameworks::foundation::NSUInteger;
++use crate::objc::{
++    id, impl_HostObject_with_superclass, msg, msg_super, nil, objc_classes, release, ClassExports,
++    NSZonePtr,
++};
++
++#[derive(Default)]
++struct UINavigationBarHostObject {
++    superclass: super::UIViewHostObject,
++    items: id,
++}
++impl_HostObject_with_superclass!(UINavigationBarHostObject);
++
++pub const CLASSES: ClassExports = objc_classes! {
++
++(env, this, _cmd);
++
++@implementation UINavigationBar: UIView
++
+++ (id)allocWithZone:(NSZonePtr)_zone {
++    let host_object = Box::<UINavigationBarHostObject>::default();
++    env.objc.alloc_object(this, host_object, &mut env.mem)
++}
++
++- (id)items {
++    env.objc.borrow::<UINavigationBarHostObject>(this).items
++}
++
++- (())setItems:(id)items {
++    let copy: id = msg![env; items copy];
++    let old = std::mem::replace(&mut env.objc.borrow_mut::<UINavigationBarHostObject>(this).items, copy);
++    release(env, old);
++}
++
++- (())setItems:(id)items animated:(bool)_animated {
++    () = msg![env; this setItems:items];
++}
++
++- (id)topItem {
++    let items: id = msg![env; this items];
++    let count: NSUInteger = msg![env; items count];
++    if count == 0 { nil } else { msg![env; items objectAtIndex:(count - 1)] }
++}
++
++- (id)backItem {
++    let items: id = msg![env; this items];
++    let count: NSUInteger = msg![env; items count];
++    if count < 2 { nil } else { msg![env; items objectAtIndex:(count - 2)] }
++}
++
++- (())dealloc {
++    let items = std::mem::replace(&mut env.objc.borrow_mut::<UINavigationBarHostObject>(this).items, nil);
++    release(env, items);
++    msg_super![env; this dealloc]
++}
++
++@end
++
++};
+diff --git a/src/frameworks/uikit/ui_view/ui_scroll_view/ui_text_view.rs b/src/frameworks/uikit/ui_view/ui_scroll_view/ui_text_view.rs
+index 7271750..74327c4 100644
+--- a/src/frameworks/uikit/ui_view/ui_scroll_view/ui_text_view.rs
++++ b/src/frameworks/uikit/ui_view/ui_scroll_view/ui_text_view.rs
+@@ -9,7 +9,7 @@ use crate::frameworks::core_graphics::cg_context::CGContextSetRGBFillColor;
+ use crate::frameworks::core_graphics::cg_geometry::CGPointZero;
+ use crate::frameworks::core_graphics::{CGFloat, CGPoint, CGRect, CGSize};
+ use crate::frameworks::foundation::ns_string::to_rust_string;
+-use crate::frameworks::foundation::{NSRange, NSUInteger};
++use crate::frameworks::foundation::{NSInteger, NSRange, NSUInteger};
+ use crate::frameworks::uikit::ui_color;
+ use crate::frameworks::uikit::ui_font::{
+     break_lines_with_font, UILineBreakModeTailTruncation, UILineBreakModeWordWrap, UITextAlignment,
+@@ -35,6 +35,18 @@ pub struct UITextViewHostObject {
+     /// `UIColor*`
+     text_color: id,
+     text_alignment: UITextAlignment,
++    keyboard_type: NSInteger,
++    input_traits: UITextViewInputTraits,
++}
++
++#[derive(Default)]
++struct UITextViewInputTraits {
++    autocapitalization_type: NSInteger,
++    autocorrection_type: NSInteger,
++    keyboard_appearance: NSInteger,
++    return_key_type: NSInteger,
++    enables_return_key_automatically: bool,
++    secure_text_entry: bool,
+ }
+ impl_HostObject_with_superclass!(UITextViewHostObject);
+ impl Default for UITextViewHostObject {
+@@ -46,6 +58,8 @@ impl Default for UITextViewHostObject {
+             text: nil,
+             text_color: nil,
+             text_alignment: UITextAlignmentLeft,
++            keyboard_type: 0,
++            input_traits: Default::default(),
+         }
+     }
+ }
+@@ -106,7 +120,9 @@ pub const CLASSES: ClassExports = objc_classes! {
+         font,
+         text,
+         text_color,
+-        text_alignment: _
++        text_alignment: _,
++        keyboard_type: _,
++        input_traits: _,
+     } = std::mem::take(env.objc.borrow_mut(this));
+ 
+     release(env, font);
+@@ -240,8 +256,49 @@ pub const CLASSES: ClassExports = objc_classes! {
+     update_scroll(env, this);
+ }
+ 
++- (UIReturnKeyType)returnKeyType {
++    env.objc.borrow::<UITextViewHostObject>(this).input_traits.return_key_type
++}
+ - (())setReturnKeyType:(UIReturnKeyType)type_ {
+-    todo_objc_setter!(this, type_);
++    env.objc.borrow_mut::<UITextViewHostObject>(this).input_traits.return_key_type = type_;
++}
++
++- (NSInteger)keyboardType {
++    env.objc.borrow::<UITextViewHostObject>(this).keyboard_type
++}
++- (())setKeyboardType:(NSInteger)type_ {
++    env.objc.borrow_mut::<UITextViewHostObject>(this).keyboard_type = type_;
++}
++
++- (NSInteger)autocapitalizationType {
++    env.objc.borrow::<UITextViewHostObject>(this).input_traits.autocapitalization_type
++}
++- (())setAutocapitalizationType:(NSInteger)type_ {
++    env.objc.borrow_mut::<UITextViewHostObject>(this).input_traits.autocapitalization_type = type_;
++}
++- (NSInteger)autocorrectionType {
++    env.objc.borrow::<UITextViewHostObject>(this).input_traits.autocorrection_type
++}
++- (())setAutocorrectionType:(NSInteger)type_ {
++    env.objc.borrow_mut::<UITextViewHostObject>(this).input_traits.autocorrection_type = type_;
++}
++- (NSInteger)keyboardAppearance {
++    env.objc.borrow::<UITextViewHostObject>(this).input_traits.keyboard_appearance
++}
++- (())setKeyboardAppearance:(NSInteger)appearance {
++    env.objc.borrow_mut::<UITextViewHostObject>(this).input_traits.keyboard_appearance = appearance;
++}
++- (bool)enablesReturnKeyAutomatically {
++    env.objc.borrow::<UITextViewHostObject>(this).input_traits.enables_return_key_automatically
++}
++- (())setEnablesReturnKeyAutomatically:(bool)enabled {
++    env.objc.borrow_mut::<UITextViewHostObject>(this).input_traits.enables_return_key_automatically = enabled;
++}
++- (bool)isSecureTextEntry {
++    env.objc.borrow::<UITextViewHostObject>(this).input_traits.secure_text_entry
++}
++- (())setSecureTextEntry:(bool)enabled {
++    env.objc.borrow_mut::<UITextViewHostObject>(this).input_traits.secure_text_entry = enabled;
+ }
+ 
+ - (())setDataDetectorTypes:(UIDataDetectorTypes)types {
+@@ -258,7 +315,9 @@ pub const CLASSES: ClassExports = objc_classes! {
+         font,
+         text,
+         text_color,
+-        text_alignment
++        text_alignment,
++        keyboard_type: _,
++        input_traits: _,
+     } = env.objc.borrow_mut(this);
+ 
+     let (r, g, b, a) = ui_color::get_rgba(&env.objc, text_color);
+diff --git a/src/frameworks/uikit/ui_view/ui_window.rs b/src/frameworks/uikit/ui_view/ui_window.rs
+index 1998df4..8f03ab3 100644
+--- a/src/frameworks/uikit/ui_view/ui_window.rs
++++ b/src/frameworks/uikit/ui_view/ui_window.rs
+@@ -194,7 +194,7 @@ pub const CLASSES: ClassExports = objc_classes! {
+         //  here we use whichever is clearer contextually.)
+         let should = msg![env; vc shouldAutorotateToInterfaceOrientation:orientation];
+         log_dbg!("[{:?} shouldAutorotateToInterfaceOrientation:{:?}] => {:?}", vc, orientation, should);
+-        if should {
++        if should && !env.options.landscape_content_layout {
+             log_dbg!("App requested autorotation; applying orientation transform to view {:?}.", view);
+             let transform = match orientation {
+                 UIInterfaceOrientationPortraitUpsideDown => CGAffineTransform::make_rotation(-std::f32::consts::PI),
+diff --git a/src/frameworks/uikit/ui_view_controller.rs b/src/frameworks/uikit/ui_view_controller.rs
+index d0a73bc..8bdb211 100644
+--- a/src/frameworks/uikit/ui_view_controller.rs
++++ b/src/frameworks/uikit/ui_view_controller.rs
+@@ -23,9 +23,10 @@ use crate::objc::{
+ use crate::Environment;
+ 
+ pub mod ui_navigation_controller;
++pub mod ui_table_view_controller;
+ 
+ #[derive(Default)]
+-struct UIViewControllerHostObject {
++pub(crate) struct UIViewControllerHostObject {
+     /// The root view.
+     /// `UIView*`
+     view: id,
+diff --git a/src/frameworks/uikit/ui_view_controller/ui_table_view_controller.rs b/src/frameworks/uikit/ui_view_controller/ui_table_view_controller.rs
+new file mode 100644
+index 0000000..a2182df
+--- /dev/null
++++ b/src/frameworks/uikit/ui_view_controller/ui_table_view_controller.rs
+@@ -0,0 +1,29 @@
++/*
++ * This Source Code Form is subject to the terms of the Mozilla Public
++ * License, v. 2.0. If a copy of the MPL was not distributed with this
++ * file, You can obtain one at https://mozilla.org/MPL/2.0/.
++ */
++//! `UITableViewController`.
++
++use crate::objc::{id, impl_HostObject_with_superclass, objc_classes, ClassExports, NSZonePtr};
++
++#[derive(Default)]
++struct UITableViewControllerHostObject {
++    superclass: super::UIViewControllerHostObject,
++}
++impl_HostObject_with_superclass!(UITableViewControllerHostObject);
++
++pub const CLASSES: ClassExports = objc_classes! {
++
++(env, this, _cmd);
++
++@implementation UITableViewController: UIViewController
++
+++ (id)allocWithZone:(NSZonePtr)_zone {
++    let host_object = Box::<UITableViewControllerHostObject>::default();
++    env.objc.alloc_object(this, host_object, &mut env.mem)
++}
++
++@end
++
++};
+diff --git a/src/gles/gles1_on_gl2.rs b/src/gles/gles1_on_gl2.rs
+index 8f99107..e70e97a 100644
+--- a/src/gles/gles1_on_gl2.rs
++++ b/src/gles/gles1_on_gl2.rs
+@@ -1270,7 +1270,8 @@ impl GLES for GLES1OnGL2<'_> {
+             self.state.pointer_is_fixed_point[1] = true;
+             gl21::NormalPointer(gl21::FLOAT, stride, pointer)
+         } else {
+-            assert!(type_ == gl21::BYTE || type_ == gl21::SHORT || type_ == gl21::FLOAT);
++            // Invalid guest enums must become GL errors, not host panics.
++            // OpenGL 2.1 validates the same normal-array types as GLES 1.1.
+             self.state.pointer_is_fixed_point[1] = false;
+             gl21::NormalPointer(type_, stride, pointer)
+         }
+diff --git a/src/gles/present.rs b/src/gles/present.rs
+index 2a140b6..5082e48 100644
+--- a/src/gles/present.rs
++++ b/src/gles/present.rs
+@@ -11,6 +11,18 @@ use super::GLES;
+ use crate::matrix::Matrix;
+ use std::time::{Duration, Instant};
+ 
++/// See the equivalent texture_rotation in ephun/tapHLE (MPL-2.0):
++/// https://github.com/ephun/tapHLE/blob/trunk/crates/taphle/src/gles/present.rs
++/// Rotate or reflect UV coordinates about the image centre. Keeping UVs in
++/// [0, 1] makes presentation independent of texture wrapping at the borders.
++fn centred_texture_transform(rotation: Matrix<2>) -> Matrix<4> {
++    let centre = rotation.transform([0.5, 0.5]);
++    let mut columns = *Matrix::<4>::from(&rotation).columns();
++    columns[3][0] = 0.5 - centre[0];
++    columns[3][1] = 0.5 - centre[1];
++    Matrix::from_columns(columns)
++}
++
+ pub struct FpsCounter {
+     time: std::time::Instant,
+     frames: u32,
+@@ -75,7 +87,7 @@ pub unsafe fn present_frame(
+     let tex_coords: [f32; 12] = [0.0, 0.0, 0.0, 1.0, 1.0, 0.0, 1.0, 0.0, 0.0, 1.0, 1.0, 1.0];
+     gles.EnableClientState(gles11::TEXTURE_COORD_ARRAY);
+     gles.TexCoordPointer(2, gles11::FLOAT, 0, tex_coords.as_ptr() as *const GLvoid);
+-    let matrix = Matrix::<4>::from(&rotation_matrix);
++    let matrix = centred_texture_transform(rotation_matrix);
+     gles.MatrixMode(gles11::TEXTURE);
+     gles.LoadMatrixf(matrix.columns().as_ptr() as *const _);
+     gles.Enable(gles11::TEXTURE_2D);
+@@ -107,3 +119,33 @@ pub unsafe fn present_frame(
+         gles.DrawArrays(gles11::TRIANGLES, 0, 6);
+     }
+ }
++
++#[cfg(test)]
++mod tests {
++    use super::*;
++
++    #[test]
++    fn presentation_preserves_centre_corners_and_distances() {
++        for turn in 0..4 {
++            for reflect in [false, true] {
++                let mut rotation = Matrix::z_rotation(turn as f32 * std::f32::consts::FRAC_PI_2);
++                if reflect {
++                    rotation = rotation.multiply(&Matrix::y_flip());
++                }
++                let matrix = centred_texture_transform(rotation);
++                let c = matrix.transform([0.5, 0.5, 0.0, 1.0]);
++                assert!((c[0] - 0.5).abs() < 1e-5 && (c[1] - 0.5).abs() < 1e-5);
++                for x in [0.0, 1.0] {
++                    for y in [0.0, 1.0] {
++                        let p = matrix.transform([x, y, 0.0, 1.0]);
++                        assert!(p[..2].iter().all(|v| (-1e-5..=1.00001).contains(v)));
++                    }
++                }
++                let a = matrix.transform([0.2, 0.3, 0.0, 1.0]);
++                let b = matrix.transform([0.6, 0.3, 0.0, 1.0]);
++                let distance = (a[0] - b[0]).hypot(a[1] - b[1]);
++                assert!((distance - 0.4).abs() < 1e-5);
++            }
++        }
++    }
++}
+diff --git a/src/libc/dlfcn.rs b/src/libc/dlfcn.rs
+index 98ea10b..e1f9be2 100644
+--- a/src/libc/dlfcn.rs
++++ b/src/libc/dlfcn.rs
+@@ -5,7 +5,7 @@
+  */
+ //! `dlfcn.h` (`dlopen()` and friends)
+ 
+-use crate::dyld::{export_c_func, FunctionExports};
++use crate::dyld::{export_c_func, Dyld, FunctionExports};
+ use crate::mem::{ConstPtr, MutVoidPtr, Ptr};
+ use crate::Environment;
+ 
+@@ -35,6 +35,9 @@ fn dlsym(env: &mut Environment, handle: MutVoidPtr, symbol: ConstPtr<u8>) -> Mut
+     );
+     // For some reason, the symbols passed to dlsym() don't have the leading _.
+     let symbol = format!("_{}", env.mem.cstr_at_utf8(symbol).unwrap());
++    if let Some(addr) = Dyld::get_constant_address(env, &symbol) {
++        return addr.cast_mut().cast();
++    }
+     // TODO: error handling. dlsym() should just return NULL in this case, but
+     // currently it's probably more useful to have the emulator crash if there's
+     // no symbol found, since it most likely indicates a missing host function.
+diff --git a/src/libc/unistd.rs b/src/libc/unistd.rs
+index d4c8914..1c7ead5 100644
+--- a/src/libc/unistd.rs
++++ b/src/libc/unistd.rs
+@@ -73,48 +73,63 @@ fn isatty(env: &mut Environment, fd: FileDescriptor) -> i32 {
+ }
+ 
+ fn access(env: &mut Environment, path: ConstPtr<u8>, mode: i32) -> i32 {
+-    // TODO: handle errno properly
+     set_errno(env, 0);
+ 
+     let binding = env.mem.cstr_at_utf8(path).unwrap();
+     let guest_path = GuestPath::new(&binding);
+     let (exists, read, write, execute) = env.fs.access(guest_path);
+-    // TODO: support ORing
+-    match mode {
+-        F_OK => {
+-            if exists {
+-                0
+-            } else {
+-                set_errno(env, ENOENT);
+-                -1
+-            }
+-        }
+-        X_OK => {
+-            if execute {
+-                0
+-            } else {
+-                set_errno(env, EACCES);
+-                -1
+-            }
+-        }
+-        W_OK => {
+-            if write {
+-                0
+-            } else {
+-                set_errno(env, EROFS);
+-                -1
+-            }
+-        }
+-        R_OK => {
+-            if read {
+-                0
+-            } else {
+-                // TODO: is it the correct error?
+-                set_errno(env, EACCES);
+-                -1
+-            }
++    match access_result((exists, read, write, execute), mode) {
++        Ok(()) => 0,
++        Err(errno) => {
++            set_errno(env, errno);
++            -1
+         }
+-        _ => unimplemented!("{}", mode),
++    }
++}
++
++fn access_result(
++    (exists, read, write, execute): (bool, bool, bool, bool),
++    mode: i32,
++) -> Result<(), i32> {
++    if mode == F_OK {
++        return if exists { Ok(()) } else { Err(ENOENT) };
++    }
++    if mode & !(R_OK | W_OK | X_OK) != 0 {
++        return Err(EINVAL);
++    }
++    if !exists {
++        return Err(ENOENT);
++    }
++    if mode & W_OK != 0 && !write {
++        return Err(EROFS);
++    }
++    if (mode & R_OK != 0 && !read) || (mode & X_OK != 0 && !execute) {
++        return Err(EACCES);
++    }
++    Ok(())
++}
++
++#[cfg(test)]
++mod access_tests {
++    use super::{access_result, EACCES, EINVAL, ENOENT, EROFS, F_OK, R_OK, W_OK, X_OK};
++
++    #[test]
++    fn combined_permissions_require_every_requested_bit() {
++        assert_eq!(access_result((true, true, true, true), W_OK | X_OK), Ok(()));
++        assert_eq!(
++            access_result((true, true, false, true), W_OK | X_OK),
++            Err(EROFS)
++        );
++        assert_eq!(
++            access_result((true, true, true, false), W_OK | X_OK),
++            Err(EACCES)
++        );
++        assert_eq!(access_result((true, false, true, true), R_OK), Err(EACCES));
++        assert_eq!(
++            access_result((false, false, false, false), F_OK),
++            Err(ENOENT)
++        );
++        assert_eq!(access_result((true, true, true, true), 8), Err(EINVAL));
+     }
+ }
+ 
+diff --git a/src/objc/objects.rs b/src/objc/objects.rs
+index 60b20ca..247c3bc 100644
+--- a/src/objc/objects.rs
++++ b/src/objc/objects.rs
+@@ -239,6 +239,16 @@ impl super::ObjC {
+         self.objects.get(&object).map(|entry| &*entry.host_object)
+     }
+ 
++    /// Snapshot live instances of an exact Objective-C class. The snapshot
++    /// allows callers to send messages that may deallocate an instance.
++    pub fn instances_of_class(&self, class: Class, mem: &Mem) -> Vec<id> {
++        self.objects
++            .keys()
++            .copied()
++            .filter(|&object| Self::read_isa(object, mem) == class)
++            .collect()
++    }
++
+     /// Get a reference to a host object and downcast it. Panics if there is
+     /// no such object, or if downcasting fails.
+     pub fn borrow<T: AnyHostObject + 'static>(&self, object: id) -> &T {
+diff --git a/src/options.rs b/src/options.rs
+index 7f13c7f..47df420 100644
+--- a/src/options.rs
++++ b/src/options.rs
+@@ -37,6 +37,8 @@ pub struct Options {
+     pub fullscreen: bool,
+     pub device_family: Option<DeviceFamily>,
+     pub initial_orientation: DeviceOrientation,
++    pub landscape_content_layout: bool,
++    pub tolerate_nil_dictionary_keys: bool,
+     pub scale_hack: NonZeroU32,
+     pub deadzone: f32,
+     pub analog_stick_tilt_controls: bool,
+@@ -46,6 +48,7 @@ pub struct Options {
+     pub y_tilt_offset: f32,
+     pub button_to_touch: HashMap<Button, (f32, f32)>,
+     pub dpad_to_touch: Option<(f32, f32, f32, f32)>,
++    pub keyboard_game_controls: bool,
+     pub stick_to_touch: Option<(f32, f32, f32, f32)>,
+     pub stabilize_virtual_cursor: Option<(f32, f32)>,
+     pub gles1_implementation: Option<GLESImplementation>,
+@@ -70,6 +73,8 @@ impl Default for Options {
+             fullscreen: false,
+             device_family: None,
+             initial_orientation: DeviceOrientation::Portrait,
++            landscape_content_layout: false,
++            tolerate_nil_dictionary_keys: false,
+             scale_hack: NonZeroU32::new(1).unwrap(),
+             analog_stick_tilt_controls: true,
+             deadzone: 0.1,
+@@ -79,6 +84,7 @@ impl Default for Options {
+             y_tilt_offset: 0.0,
+             button_to_touch: HashMap::new(),
+             dpad_to_touch: None,
++            keyboard_game_controls: false,
+             stick_to_touch: None,
+             stabilize_virtual_cursor: None,
+             gles1_implementation: None,
+@@ -122,6 +128,12 @@ impl Options {
+             self.initial_orientation = DeviceOrientation::LandscapeLeft;
+         } else if arg == "--landscape-right" {
+             self.initial_orientation = DeviceOrientation::LandscapeRight;
++        } else if arg == "--landscape-content-layout" {
++            self.landscape_content_layout = true;
++        } else if arg == "--tolerate-nil-dictionary-keys" {
++            self.tolerate_nil_dictionary_keys = true;
++        } else if arg == "--keyboard-game-controls" {
++            self.keyboard_game_controls = true;
+         } else if let Some(value) = arg.strip_prefix("--device-family=") {
+             let parsed =
+                 DeviceFamily::try_from(value).map_err(|_| "Invalid device family".to_string())?;
+diff --git a/src/window.rs b/src/window.rs
+index d4eae99..295617e 100644
+--- a/src/window.rs
++++ b/src/window.rs
+@@ -18,11 +18,12 @@ use crate::image::Image;
+ use crate::matrix::Matrix;
+ use crate::options::Options;
+ use crate::Environment;
++use sdl2::keyboard::{Keycode, Scancode};
+ use sdl2::mouse::MouseButton;
+ use sdl2::pixels::PixelFormatEnum;
+ use sdl2::surface::Surface;
+ use sdl2_sys::SDL_PowerState;
+-use std::collections::{HashMap, VecDeque};
++use std::collections::{HashMap, HashSet, VecDeque};
+ use std::env;
+ use std::f32::consts::{FRAC_PI_2, PI};
+ use std::num::NonZeroU32;
+@@ -76,6 +77,15 @@ pub enum DeviceOrientation {
+     LandscapeLeft,
+     LandscapeRight,
+ }
++
++fn orientation_rotation(orientation: DeviceOrientation) -> Matrix<2> {
++    match orientation {
++        DeviceOrientation::Portrait => Matrix::identity(),
++        DeviceOrientation::PortraitUpsideDown => Matrix::z_rotation(PI),
++        DeviceOrientation::LandscapeLeft => Matrix::z_rotation(-FRAC_PI_2),
++        DeviceOrientation::LandscapeRight => Matrix::z_rotation(FRAC_PI_2),
++    }
++}
+ fn size_for_orientation(
+     family: DeviceFamily,
+     orientation: DeviceOrientation,
+@@ -105,6 +115,35 @@ fn rotate_fullscreen_size(orientation: DeviceOrientation, screen_size: (u32, u32
+         }
+     }
+ }
++
++fn transform_input_in_viewport(
++    (in_x, in_y): (f32, f32),
++    (vx, vy, vw, vh): (u32, u32, u32, u32),
++    (out_w, out_h): (u32, u32),
++    rotation: Matrix<2>,
++) -> (f32, f32) {
++    let x = (in_x - vx as f32) / vw as f32 - 0.5;
++    let y = (in_y - vy as f32) / vh as f32 - 0.5;
++    let [x, y] = rotation.inverse().unwrap().transform([x, y]);
++    ((x + 0.5) * out_w as f32, (y + 0.5) * out_h as f32)
++}
++
++#[cfg(test)]
++#[test]
++fn landscape_content_input_matches_visible_position() {
++    let viewport = (0, 0, 960, 640);
++    let output = (480, 320);
++    for (screen, expected) in [
++        ((0.0, 0.0), (0.0, 0.0)),
++        ((480.0, 320.0), (240.0, 160.0)),
++        ((960.0, 640.0), (480.0, 320.0)),
++    ] {
++        assert_eq!(
++            transform_input_in_viewport(screen, viewport, output, Matrix::identity()),
++            expected
++        );
++    }
++}
+ /// Tell SDL2 what orientation we want. Only useful on Android.
+ fn set_sdl2_orientation(orientation: DeviceOrientation) {
+     // Despite the name, this hint works on Android too.
+@@ -129,6 +168,8 @@ pub enum FingerId {
+     ButtonToTouch(crate::options::Button),
+     StickToTouch,
+     DpadToTouch,
++    KeyboardDirection,
++    KeyboardAttack,
+ }
+ pub type Coords = (f32, f32);
+ 
+@@ -140,6 +181,112 @@ struct DpadState {
+     active: bool,
+ }
+ 
++#[derive(Copy, Clone, Eq, PartialEq, Hash, Debug)]
++enum GameKey {
++    A,
++    D,
++    W,
++    Left,
++    Right,
++    Up,
++    Space,
++    Escape,
++}
++
++fn game_key(scancode: Option<Scancode>, keycode: Option<Keycode>) -> Option<GameKey> {
++    match scancode {
++        Some(Scancode::A) => Some(GameKey::A),
++        Some(Scancode::D) => Some(GameKey::D),
++        Some(Scancode::W) => Some(GameKey::W),
++        Some(Scancode::Left) => Some(GameKey::Left),
++        Some(Scancode::Right) => Some(GameKey::Right),
++        Some(Scancode::Up) => Some(GameKey::Up),
++        Some(Scancode::Space) => Some(GameKey::Space),
++        Some(Scancode::Escape) => Some(GameKey::Escape),
++        Some(_) => None,
++        None => match keycode {
++            Some(Keycode::A) => Some(GameKey::A),
++            Some(Keycode::D) => Some(GameKey::D),
++            Some(Keycode::W) => Some(GameKey::W),
++            Some(Keycode::Left) => Some(GameKey::Left),
++            Some(Keycode::Right) => Some(GameKey::Right),
++            Some(Keycode::Up) => Some(GameKey::Up),
++            Some(Keycode::Space) => Some(GameKey::Space),
++            Some(Keycode::Escape) => Some(GameKey::Escape),
++            _ => None,
++        },
++    }
++}
++
++fn keyboard_horizontal_direction(keys: &HashSet<GameKey>) -> Option<crate::options::Button> {
++    let has = |a, b| keys.contains(&a) || keys.contains(&b);
++    let left = has(GameKey::A, GameKey::Left);
++    let right = has(GameKey::D, GameKey::Right);
++    match (left, right) {
++        (true, false) => Some(crate::options::Button::DPadLeft),
++        (false, true) => Some(crate::options::Button::DPadRight),
++        _ => None,
++    }
++}
++
++fn starts_door_action(keys: &HashSet<GameKey>, key: GameKey, pressed: bool) -> bool {
++    pressed
++        && matches!(key, GameKey::W | GameKey::Up)
++        && !keys.contains(&GameKey::W)
++        && !keys.contains(&GameKey::Up)
++}
++
++#[cfg(test)]
++#[test]
++fn keyboard_direction_combines_aliases_and_cancels_opposites() {
++    let mut keys = HashSet::from([GameKey::A, GameKey::Left]);
++    assert_eq!(
++        keyboard_horizontal_direction(&keys),
++        Some(crate::options::Button::DPadLeft)
++    );
++    keys.remove(&GameKey::A);
++    assert_eq!(
++        keyboard_horizontal_direction(&keys),
++        Some(crate::options::Button::DPadLeft)
++    );
++    keys.insert(GameKey::D);
++    assert_eq!(keyboard_horizontal_direction(&keys), None);
++    keys.remove(&GameKey::Left);
++    assert_eq!(
++        keyboard_horizontal_direction(&keys),
++        Some(crate::options::Button::DPadRight)
++    );
++}
++
++#[cfg(test)]
++#[test]
++fn physical_game_keys_do_not_depend_on_layout_keycodes() {
++    assert_eq!(game_key(Some(Scancode::W), None), Some(GameKey::W));
++    assert_eq!(game_key(Some(Scancode::Up), None), Some(GameKey::Up));
++    assert_eq!(game_key(None, Some(Keycode::Up)), Some(GameKey::Up));
++    assert_eq!(game_key(Some(Scancode::E), Some(Keycode::E)), None);
++    assert_eq!(game_key(Some(Scancode::E), Some(Keycode::W)), None);
++    assert_eq!(game_key(Some(Scancode::A), None), Some(GameKey::A));
++    assert_eq!(
++        game_key(Some(Scancode::Escape), None),
++        Some(GameKey::Escape)
++    );
++}
++
++#[cfg(test)]
++#[test]
++fn door_action_aliases_fire_once_until_both_released() {
++    let mut keys = HashSet::new();
++    assert!(starts_door_action(&keys, GameKey::W, true));
++    keys.insert(GameKey::W);
++    assert!(!starts_door_action(&keys, GameKey::Up, true));
++    keys.insert(GameKey::Up);
++    keys.remove(&GameKey::W);
++    assert!(!starts_door_action(&keys, GameKey::W, true));
++    keys.remove(&GameKey::Up);
++    assert!(starts_door_action(&keys, GameKey::Up, true));
++}
++
+ #[derive(Debug)]
+ pub enum TextInputEvent {
+     Text(String),
+@@ -160,12 +307,102 @@ pub enum Event {
+     TouchesDown(HashMap<FingerId, Coords>),
+     TouchesMove(HashMap<FingerId, Coords>),
+     TouchesUp(HashMap<FingerId, Coords>),
++    /// Activate the visible door entry in 8-Bit Rebellion.
++    ActivateDoor,
++    ToggleGameMenu,
+     /// User pressed F12, requesting that execution be paused and the debugger
+     /// take over.
+     EnterDebugger,
+     TextInput(TextInputEvent),
+ }
+ 
++#[derive(Default)]
++struct VideoTouchFilter {
++    active: bool,
++    skip_requested: bool,
++    delivered: HashSet<FingerId>,
++    suppressed: HashSet<FingerId>,
++}
++
++impl VideoTouchFilter {
++    fn filter(&mut self, event: Event) -> Option<Event> {
++        match event {
++            Event::TouchesDown(touches) if self.active => {
++                if !touches.is_empty() {
++                    self.skip_requested = true;
++                    self.suppressed.extend(touches.keys().copied());
++                }
++                None
++            }
++            Event::TouchesDown(touches) => {
++                for finger in touches.keys() {
++                    self.suppressed.remove(finger);
++                    self.delivered.insert(*finger);
++                }
++                Some(Event::TouchesDown(touches))
++            }
++            Event::TouchesMove(mut touches) => {
++                if self.active || !self.suppressed.is_empty() {
++                    touches.retain(|finger, _| self.delivered.contains(finger));
++                }
++                (!touches.is_empty()).then_some(Event::TouchesMove(touches))
++            }
++            Event::TouchesUp(mut touches) => {
++                touches.retain(|finger, _| {
++                    self.delivered.remove(finger);
++                    !self.suppressed.remove(finger)
++                });
++                (!touches.is_empty()).then_some(Event::TouchesUp(touches))
++            }
++            other => Some(other),
++        }
++    }
++}
++
++#[cfg(test)]
++mod video_touch_tests {
++    use super::{Event, FingerId, HashMap, VideoTouchFilter};
++
++    fn touch_down(finger: FingerId) -> Event {
++        Event::TouchesDown(HashMap::from([(finger, (10.0, 20.0))]))
++    }
++    fn touch_up(finger: FingerId) -> Event {
++        Event::TouchesUp(HashMap::from([(finger, (10.0, 20.0))]))
++    }
++
++    #[test]
++    fn video_tap_is_consumed_without_leaking_release_to_game() {
++        for finger in [
++            FingerId::Mouse,
++            FingerId::Touch(42),
++            FingerId::ButtonToTouch(crate::options::Button::A),
++        ] {
++            let mut filter = VideoTouchFilter::default();
++            filter.active = true;
++            assert!(filter.filter(touch_down(finger)).is_none());
++            assert!(filter.skip_requested);
++            filter.active = false;
++            assert!(filter.filter(touch_up(finger)).is_none());
++            assert!(matches!(
++                filter.filter(touch_down(finger)),
++                Some(Event::TouchesDown(_))
++            ));
++        }
++    }
++
++    #[test]
++    fn release_of_touch_that_started_before_video_reaches_game() {
++        let mut filter = VideoTouchFilter::default();
++        assert!(filter.filter(touch_down(FingerId::Mouse)).is_some());
++        filter.active = true;
++        assert!(matches!(
++            filter.filter(touch_up(FingerId::Mouse)),
++            Some(Event::TouchesUp(_))
++        ));
++        assert!(!filter.skip_requested);
++    }
++}
++
+ pub enum BatteryState {
+     Unknown,
+     OnBattery,
+@@ -229,13 +466,19 @@ pub struct Window {
+     /// [Self::rotatable_fullscreen] returns [true].
+     fullscreen: bool,
+     scale_hack: NonZeroU32,
++    landscape_content_layout: bool,
+     internal_gl_ins: Option<Box<dyn GLESContext>>,
+     splash_image: Option<Image>,
++    launch_image_orientation: DeviceOrientation,
++    video_frame: Option<Image>,
++    video_touch_filter: VideoTouchFilter,
+     device_family: DeviceFamily,
+     device_orientation: DeviceOrientation,
+     controller_ctx: sdl2::GameControllerSubsystem,
+     controllers: Vec<sdl2::controller::GameController>,
+     dpad_state: DpadState,
++    keyboard_keys: HashSet<GameKey>,
++    keyboard_direction_active: Option<crate::options::Button>,
+     stick_active: bool,
+     _sensor_ctx: sdl2::SensorSubsystem,
+     accelerometer: Option<sdl2::sensor::Sensor>,
+@@ -378,8 +621,12 @@ impl Window {
+             viewport_y_offset: 0,
+             fullscreen,
+             scale_hack,
++            landscape_content_layout: options.landscape_content_layout,
+             internal_gl_ins: None,
+             splash_image: launch_image,
++            launch_image_orientation: device_orientation,
++            video_frame: None,
++            video_touch_filter: VideoTouchFilter::default(),
+             device_family,
+             device_orientation,
+             controller_ctx,
+@@ -391,6 +638,8 @@ impl Window {
+                 down: false,
+                 active: false,
+             },
++            keyboard_keys: HashSet::new(),
++            keyboard_direction_active: None,
+             stick_active: false,
+             _sensor_ctx: sensor_ctx,
+             accelerometer,
+@@ -449,16 +698,22 @@ impl Window {
+             } else {
+                 window.viewport()
+             };
+-            // normalize to unit square centred on origin
+-            let x = (in_x - vx as f32) / vw as f32 - 0.5;
+-            let y = (in_y - vy as f32) / vh as f32 - 0.5;
+-            // rotate
+-            let matrix = window.rotation_matrix().inverse().unwrap();
+-            let [x, y] = matrix.transform([x, y]);
+-            // back to pixels
+-            let (out_w, out_h) = window.size_unrotated_unscaled();
+-            let out_x = (x + 0.5) * out_w as f32;
+-            let out_y = (y + 0.5) * out_h as f32;
++            // Match the transform used to present the content. In landscape
++            // content layout the guest already draws in landscape coordinates.
++            let (rotation, output_size) = if window.landscape_content_layout {
++                (
++                    Matrix::identity(),
++                    size_for_orientation(
++                        window.device_family,
++                        window.device_orientation,
++                        NonZeroU32::new(1).unwrap(),
++                    ),
++                )
++            } else {
++                (window.rotation_matrix(), window.size_unrotated_unscaled())
++            };
++            let (out_x, out_y) =
++                transform_input_in_viewport((in_x, in_y), (vx, vy, vw, vh), output_size, rotation);
+             // Round to match touch precision of official devices.
+             (out_x.round(), out_y.round())
+         }
+@@ -542,7 +797,8 @@ impl Window {
+                 _ => {}
+             }
+ 
+-            self.event_queue.push_back(match event {
++            let mut keyboard_release = None;
++            let mapped_event = match event {
+                 E::Quit { .. } => Event::Quit,
+                 E::MouseButtonDown {
+                     x,
+@@ -760,6 +1016,9 @@ impl Window {
+                     let curr_timestamp = timestamp;
+                     let abs_coords = finger_absolute_coords(self, (x, y));
+                     let coords = transform_input_coords(self, abs_coords, false);
++                    if options.keyboard_game_controls && !matches!(&event, E::FingerMotion { .. }) {
++                        log!("8-Bit Rebellion SDL finger {event:?}: guest={coords:?}");
++                    }
+                     log_dbg!("Finger event x {}, y {}, coords {:?}", x, y, coords);
+                     let mut map = HashMap::from([(FingerId::Touch(finger_id), coords)]);
+                     while let Some(next) = self.event_pump.poll_event() {
+@@ -824,6 +1083,120 @@ impl Window {
+                     echo!("F12 pressed, EnterDebugger event queued.");
+                     Event::EnterDebugger
+                 }
++                E::Window {
++                    win_event: sdl2::event::WindowEvent::FocusLost,
++                    ..
++                } if options.keyboard_game_controls => {
++                    let mut touches = HashMap::new();
++                    if let Some(old) = self.keyboard_direction_active.take() {
++                        if let Some(&(x, y)) = options.button_to_touch.get(&old) {
++                            touches.insert(
++                                FingerId::KeyboardDirection,
++                                transform_input_coords(self, (x, y), true),
++                            );
++                        }
++                    }
++                    if self.keyboard_keys.contains(&GameKey::Space) {
++                        if let Some(&(x, y)) =
++                            options.button_to_touch.get(&crate::options::Button::A)
++                        {
++                            touches.insert(
++                                FingerId::KeyboardAttack,
++                                transform_input_coords(self, (x, y), true),
++                            );
++                        }
++                    }
++                    self.keyboard_keys.clear();
++                    if touches.is_empty() {
++                        continue;
++                    }
++                    Event::TouchesUp(touches)
++                }
++                E::KeyDown {
++                    keycode, scancode, ..
++                }
++                | E::KeyUp {
++                    keycode, scancode, ..
++                } if options.keyboard_game_controls && game_key(scancode, keycode).is_some() => {
++                    let key = game_key(scancode, keycode).unwrap();
++                    let pressed = matches!(event, E::KeyDown { .. });
++                    let start_door_action = starts_door_action(&self.keyboard_keys, key, pressed);
++                    let changed = if pressed {
++                        self.keyboard_keys.insert(key)
++                    } else {
++                        self.keyboard_keys.remove(&key)
++                    };
++                    if !changed {
++                        continue; // SDL key repeat must not create extra touches.
++                    }
++
++                    log!(
++                        "8-Bit Rebellion key {:?} {}: direction={:?}, attack_held={}",
++                        key,
++                        if pressed { "down" } else { "up" },
++                        keyboard_horizontal_direction(&self.keyboard_keys),
++                        self.keyboard_keys.contains(&GameKey::Space),
++                    );
++
++                    if key == GameKey::Space {
++                        let Some(&(x, y)) = options.button_to_touch.get(&crate::options::Button::A)
++                        else {
++                            continue;
++                        };
++                        let coords = transform_input_coords(self, (x, y), true);
++                        if pressed {
++                            Event::TouchesDown(HashMap::from([(FingerId::KeyboardAttack, coords)]))
++                        } else {
++                            Event::TouchesUp(HashMap::from([(FingerId::KeyboardAttack, coords)]))
++                        }
++                    } else if key == GameKey::W || key == GameKey::Up {
++                        if start_door_action {
++                            Event::ActivateDoor
++                        } else {
++                            continue;
++                        }
++                    } else if key == GameKey::Escape {
++                        if pressed {
++                            Event::ToggleGameMenu
++                        } else {
++                            continue;
++                        }
++                    } else {
++                        let new_direction = keyboard_horizontal_direction(&self.keyboard_keys);
++                        let old_direction = self.keyboard_direction_active;
++                        if old_direction == new_direction {
++                            continue;
++                        }
++                        self.keyboard_direction_active = new_direction;
++                        let touch_for = |this: &Window, button| {
++                            options
++                                .button_to_touch
++                                .get(&button)
++                                .map(|&(x, y)| transform_input_coords(this, (x, y), true))
++                        };
++                        if let Some(old) = old_direction {
++                            if let Some(coords) = touch_for(self, old) {
++                                keyboard_release = Some(Event::TouchesUp(HashMap::from([(
++                                    FingerId::KeyboardDirection,
++                                    coords,
++                                )])));
++                            }
++                        }
++                        if let Some(new) = new_direction {
++                            let Some(coords) = touch_for(self, new) else {
++                                continue;
++                            };
++                            Event::TouchesDown(HashMap::from([(
++                                FingerId::KeyboardDirection,
++                                coords,
++                            )]))
++                        } else if let Some(release) = keyboard_release.take() {
++                            release
++                        } else {
++                            continue;
++                        }
++                    }
++                }
+                 E::KeyDown {
+                     keycode: Some(sdl2::keyboard::Keycode::Backspace),
+                     ..
+@@ -843,7 +1216,11 @@ impl Window {
+                     Event::TextInput(TextInputEvent::Text(text))
+                 }
+                 _ => continue,
+-            })
++            };
++            if let Some(release) = keyboard_release {
++                self.event_queue.push_back(release);
++            }
++            self.event_queue.push_back(mapped_event);
+         }
+ 
+         if controller_updated {
+@@ -868,12 +1245,22 @@ impl Window {
+         }
+     }
+ 
++    pub(crate) fn held_keyboard_direction(&self) -> Option<crate::options::Button> {
++        self.keyboard_direction_active
++    }
++
+     /// Pop an event from the queue (in FIFO order, except for high priority
+     /// events)
+     pub fn pop_event(&mut self) -> Option<Event> {
+-        self.high_priority_event
+-            .take()
+-            .or_else(|| self.event_queue.pop_front())
++        loop {
++            let event = self
++                .high_priority_event
++                .take()
++                .or_else(|| self.event_queue.pop_front())?;
++            if let Some(event) = self.video_touch_filter.filter(event) {
++                return Some(event);
++            }
++        }
+     }
+ 
+     fn controller_added(&mut self, joystick_idx: u32) {
+@@ -1203,12 +1590,18 @@ impl Window {
+ 
+         // OpenGL ES expects bottom-to-top row order for image data, but our
+         // image data will be top-to-bottom. A reflection transform compensates.
+-        let matrix = self.rotation_matrix().multiply(&Matrix::y_flip());
++        let rotation = if self.landscape_content_layout {
++            // The compositor rotates vertices, while this path rotates texture
++            // coordinates: the matching launch orientation is its inverse.
++            orientation_rotation(self.launch_image_orientation).transpose()
++        } else {
++            self.rotation_matrix()
++        };
++        let matrix = rotation.multiply(&Matrix::y_flip());
+         let (vx, vy, vw, vh) = self.viewport();
+         let viewport = (vx, vy + self.viewport_y_offset(), vw, vh);
+ 
+         let image = self.splash_image.as_ref().unwrap();
+-
+         unsafe {
+             let mut gl_ctx = self
+                 .internal_gl_ins
+@@ -1265,7 +1658,96 @@ impl Window {
+ 
+     /// Swap front-buffer and back-buffer so the result of OpenGL rendering is
+     /// presented.
+-    pub fn swap_window(&self) {
++    pub fn set_video_frame(&mut self, frame: Option<Image>) {
++        self.video_frame = frame;
++    }
++
++    pub fn set_video_touch_active(&mut self, active: bool) {
++        self.video_touch_filter.active = active;
++        if active {
++            self.video_touch_filter.skip_requested = false;
++        }
++    }
++
++    pub fn take_video_skip_request(&mut self) -> bool {
++        std::mem::take(&mut self.video_touch_filter.skip_requested)
++    }
++
++    fn draw_video_frame(&mut self) {
++        let Some(image) = self.video_frame.as_ref() else {
++            return;
++        };
++        let (screen_width, screen_height) = self.window.drawable_size();
++        let (width, height) = image.dimensions();
++        let scale = (screen_width as f32 / width as f32).min(screen_height as f32 / height as f32);
++        let output_width = (width as f32 * scale).round() as u32;
++        let output_height = (height as f32 * scale).round() as u32;
++        let viewport = (
++            (screen_width - output_width) / 2,
++            (screen_height - output_height) / 2,
++            output_width,
++            output_height,
++        );
++
++        unsafe {
++            use crate::gles::gles11_raw as gles11;
++
++            let mut gl_ctx = self
++                .internal_gl_ins
++                .as_mut()
++                .unwrap()
++                .make_current_unchecked_for_window(
++                    &mut |ctx| self.window.gl_make_current(&ctx.0).unwrap(),
++                    &mut |name| self.video_ctx.gl_get_proc_address(name) as *const _,
++                );
++            gl_ctx.Disable(gles11::SCISSOR_TEST);
++            gl_ctx.Disable(gles11::BLEND);
++            gl_ctx.Disable(gles11::DEPTH_TEST);
++            gl_ctx.Disable(gles11::STENCIL_TEST);
++            gl_ctx.Disable(gles11::ALPHA_TEST);
++            gl_ctx.Disable(gles11::CULL_FACE);
++            gl_ctx.Disable(gles11::LIGHTING);
++            gl_ctx.Disable(gles11::FOG);
++            gl_ctx.DisableClientState(gles11::COLOR_ARRAY);
++            gl_ctx.Color4f(1.0, 1.0, 1.0, 1.0);
++            for mode in [gles11::PROJECTION, gles11::MODELVIEW, gles11::TEXTURE] {
++                gl_ctx.MatrixMode(mode);
++                gl_ctx.LoadIdentity();
++            }
++            let mut texture = 0;
++            gl_ctx.GenTextures(1, &mut texture);
++            gl_ctx.BindTexture(gles11::TEXTURE_2D, texture);
++            gl_ctx.TexImage2D(
++                gles11::TEXTURE_2D,
++                0,
++                gles11::RGBA as _,
++                width as _,
++                height as _,
++                0,
++                gles11::RGBA,
++                gles11::UNSIGNED_BYTE,
++                image.pixels().as_ptr() as *const _,
++            );
++            gl_ctx.TexParameteri(
++                gles11::TEXTURE_2D,
++                gles11::TEXTURE_MIN_FILTER,
++                gles11::LINEAR as _,
++            );
++            gl_ctx.TexParameteri(
++                gles11::TEXTURE_2D,
++                gles11::TEXTURE_MAG_FILTER,
++                gles11::LINEAR as _,
++            );
++            gl_ctx.BindFramebufferOES(gles11::FRAMEBUFFER_OES, 0);
++            present_frame(gl_ctx.as_mut(), viewport, Matrix::y_flip(), None);
++            gl_ctx.DeleteTextures(1, &texture);
++        }
++    }
++
++    pub fn swap_window(&mut self) {
++        if self.video_frame.is_some() {
++            self.draw_video_frame();
++        }
+         self.window.gl_swap_window();
+     }
+ 
+@@ -1400,12 +1882,16 @@ impl Window {
+     /// rotating texture co-ordinates to display the image in the window; when
+     /// rotating input co-ordinates, invert the matrix.
+     pub fn rotation_matrix(&self) -> Matrix<2> {
+-        match self.device_orientation {
+-            DeviceOrientation::Portrait => Matrix::identity(),
+-            DeviceOrientation::PortraitUpsideDown => Matrix::z_rotation(PI),
+-            DeviceOrientation::LandscapeLeft => Matrix::z_rotation(-FRAC_PI_2),
+-            DeviceOrientation::LandscapeRight => Matrix::z_rotation(FRAC_PI_2),
+-        }
++        orientation_rotation(self.device_orientation)
++    }
++
++    /// A UIKit view can keep showing the launch image while the app starts.
++    /// Match its decoded pixels so presentation adjustments cannot affect
++    /// unrelated full-screen images in the game.
++    pub fn is_launch_image(&self, image: &Image) -> bool {
++        self.splash_image.as_ref().is_some_and(|launch| {
++            launch.dimensions() == image.dimensions() && launch.pixels() == image.pixels()
++        })
+     }
+ 
+     pub fn is_screen_saver_enabled(&self) -> bool {
+diff --git a/tests/TestApp_source/cli_tests.m b/tests/TestApp_source/cli_tests.m
+index 651258d..74c200c 100644
+--- a/tests/TestApp_source/cli_tests.m
++++ b/tests/TestApp_source/cli_tests.m
+@@ -15,6 +15,7 @@
+ #include <CoreFoundation/CFURL.h>
+ #include <arpa/inet.h>
+ #include <dirent.h>
++#include <dlfcn.h>
+ #include <errno.h>
+ #include <fcntl.h>
+ #include <fenv.h>
+@@ -6464,6 +6465,22 @@ int test_fcvt() {
+   return 0;
+ }
+ 
++extern void *UIApplicationDidReceiveMemoryWarningNotification;
++
++int test_dlsym_constant() {
++  void *direct = &UIApplicationDidReceiveMemoryWarningNotification;
++  void *dynamic = dlsym(RTLD_DEFAULT,
++                        "UIApplicationDidReceiveMemoryWarningNotification");
++  if (dynamic != direct)
++    return -1;
++  if (dlsym(RTLD_DEFAULT, "UIApplicationDidReceiveMemoryWarningNotification") !=
++      direct)
++    return -2;
++  if (*(void **)dynamic == NULL)
++    return -3;
++  return 0;
++}
++
+ // clang-format off
+ #define FUNC_DEF(func)                                                         \
+   { &func, #func }
+@@ -6580,6 +6597,7 @@ struct {
+     FUNC_DEF(test_malloc_zone_basic),
+     FUNC_DEF(test_malloc_zone_struct_dispatch),
+     FUNC_DEF(test_fcvt),
++    FUNC_DEF(test_dlsym_constant),
+ };
+ // clang-format on
+ 

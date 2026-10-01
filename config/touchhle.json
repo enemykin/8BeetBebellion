@@ -1,0 +1,7 @@
+{
+  "repository": "https://github.com/touchHLE/touchHLE.git",
+  "branch": "trunk",
+  "pinned_commit": "b432f552d8a754c0274da5156f030ca3ac4d0218",
+  "pinned_at_utc": "2026-09-30T00:00:00Z",
+  "purpose": "Reproducible baseline for the initial 8BeetBebellion compatibility investigation"
+}
