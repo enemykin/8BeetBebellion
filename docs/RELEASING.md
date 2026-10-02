@@ -6,22 +6,33 @@ The first binary-release target is **Apple Silicon (arm64, M1 and newer)**. A re
 
 This document defines the packaging procedure. **A self-contained release has not been built or validated yet.** The current repository instructions build from source. The existing local touchHLE release binary links only to macOS system libraries/frameworks, but the locally installed Homebrew FFmpeg/ffplay binaries depend on Homebrew libraries and cannot be copied alone into a portable package.
 
+## Selected design
+
+Use statically linked FFmpeg libraries and statically linked SDL2 for ffplay. Ship a native **Start Bebellion.app** in a ZIP for Apple Silicon. The player unpacks the ZIP, places their decrypted IPA in the adjacent input directory, and opens the application. All non-system runtime dependencies are supplied by the package; only macOS frameworks/libraries remain external. Developer ID signing and notarization are part of the intended ordinary first-launch experience.
+
+This is the selected packaging design, not a claim that the finished application has already been built or tested.
+
 ## Package contents
 
 Use an explicit allowlist when assembling a new, empty staging directory under the ignored build directory:
 
 ```text
 8BeetBebellion-macos-arm64/
-  Start Bebellion.command
+  Start Bebellion.app/
+    Contents/
+      Info.plist
+      MacOS/
+        launcher                 native executable; no Python required
+        touchHLE                 ordinary release binary, no test tools
+        ffmpeg                   static arm64 build
+        ffplay                   static arm64 build, including SDL2
+      Resources/
+        touchHLE_dylibs/          upstream support libraries + notices
+        touchHLE_fonts/           upstream fonts + notices
+        touchHLE_default_options.txt
   input/                         empty; the player adds their IPA here
   reports/                       empty; runtime logs go here
-  runtime/
-    touchHLE                     ordinary release binary, no test tools
-    ffmpeg                       portable arm64 build
-    ffplay                       portable arm64 build
-    touchHLE_dylibs/              upstream emulator support libraries + notices
-    touchHLE_fonts/               upstream fonts + notices
-    touchHLE_default_options.txt
+  runtime/                       empty; local saves/preferences created at launch
   licenses/                      exact licenses/notices for shipped components
   README.txt                     short player instructions
   BUILD-MANIFEST.json            versions, commits, flags, deployment target
@@ -50,19 +61,19 @@ Keep the default static feature enabled. It builds SDL2 and OpenAL Soft into tou
 
 Build FFmpeg and ffplay from a pinned official [FFmpeg source release](https://ffmpeg.org/download.html), with the required game codecs and filters. Keep the exact source archive, checksum, configuration flags and any patches for the corresponding-source download.
 
-Prefer static FFmpeg libraries and a static SDL2 dependency for ffplay, leaving only macOS system dependencies. Ensure movie decoding, `scale=480:320,fps=30`, raw RGBA output, pipe input, audio playback and `-nodisp` work with the commands used in `movie_player.rs`. Disable unnecessary external codec libraries instead of inheriting a full Homebrew build's dependency graph. Never enable FFmpeg's nonfree configuration in a redistributable build.
+The selected build uses static FFmpeg libraries and a static SDL2 dependency for ffplay, leaving only macOS system dependencies. Ensure movie decoding, `scale=480:320,fps=30`, raw RGBA output, pipe input, audio playback and `-nodisp` work with the commands used in `movie_player.rs`. Disable unnecessary external codec libraries instead of inheriting a full Homebrew build's dependency graph. Never enable FFmpeg's nonfree configuration in a redistributable build.
 
-A dynamic build is also possible, but every non-system dependency must be bundled recursively, its load paths rewritten to package-relative paths such as `@loader_path`, and its licenses and corresponding sources provided as required. Copying only ffmpeg/ffplay, or adding Homebrew directories to PATH, does not make the package self-contained.
+The release dependency audit must confirm that this static configuration does not pull in external Homebrew dylibs. Keeping FFmpeg external libraries disabled reduces the dependency set that must be built, licensed and maintained.
 
 Check every shipped native binary and dylib with `file`, `otool -L` and `otool -l`. There must be no unresolved paths to `/opt/homebrew`, `/usr/local/Cellar`, another build prefix or the developer's home directory. Check LC_RPATH entries as well as directly linked libraries. Run the bundled video tools with a restricted PATH containing only package tools and macOS system commands, using a small generated fixture rather than game content.
 
 ## Release launcher
 
-The bundled launcher should use macOS's built-in zsh, set PATH to the bundled video-tools directory plus system command directories, and run the bundled touchHLE with the same gameplay options as Start Bebellion.command. It must not invoke Python or look for the source-checkout `vendor/touchHLE/target` directory.
+The native launcher resolves the package root from its own .app location, sets the child process PATH to Contents/MacOS plus system command directories, and runs the bundled touchHLE with the same gameplay options as Start Bebellion.command. It must not invoke Python or look for the source-checkout vendor/touchHLE/target directory.
 
-It resolves the default IPA relative to the package root (`input/8Bit Rebellion v1.4.5.ipa`), accepts BEBELLION_IPA for another path, creates a fresh timestamped runtime log, and changes working directory to runtime before starting touchHLE so the upstream fonts, support libraries and default options can be found. Normal saves and display settings stay local to that runtime directory. Report missing IPA errors clearly. Preserve executable permissions in the archive.
+The default IPA is input/8Bit Rebellion v1.4.5.ipa beside the .app. Accept BEBELLION_IPA for another path and report a missing IPA clearly. Create a timestamped runtime log under reports and use the adjacent runtime directory for writable saves and host preferences. Bundled emulator fonts, support libraries and default options remain in Contents/Resources. A native missing-IPA message should explain which folder to use.
 
-For a future .app version, put emulator resources in Contents/Resources and writable saves/preferences in a user-data directory, not inside a signed application bundle. Adding the IPA must not modify the signed bundle either. A portable folder is the simpler first package.
+Never write saves, preferences, game files or logs into the signed .app. Adding the IPA beside the application must not change its signature. The launcher must preserve the running child's lifecycle and exit status. Verify paths containing spaces and launch from Finder as well as Terminal.
 
 ## Licenses and corresponding source
 
