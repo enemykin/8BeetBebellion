@@ -48,6 +48,8 @@ def tracked_copy(source, destination):
     """Copy only Git-tracked source, recursively entering tracked submodules."""
     files = run(["git", "-C", source, "ls-files", "-z"]).decode().split("\0")
     for name in filter(None, files):
+        if Path(name).name == "AGENTS.md":
+            continue
         src = source / name
         dst = destination / name
         if src.is_symlink():
