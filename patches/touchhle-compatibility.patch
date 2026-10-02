@@ -47,6 +47,288 @@ index 9297a5f..c270df9 100644
      --stabilize-virtual-cursor=...
          Apply motion smoothing and a sticky radius to the virtual cursor
          (controlled by the right analog stick).
+diff --git a/src/audio/openal.rs b/src/audio/openal.rs
+index e7539d4..b97f6b4 100644
+--- a/src/audio/openal.rs
++++ b/src/audio/openal.rs
+@@ -5,7 +5,9 @@
+  */
+ //! Wrapper for OpenAL usage.
+ use al_sys::alc_types::{ALCcontext, ALCdevice};
++use std::cell::Cell;
+ use std::marker::PhantomData;
++use std::rc::{Rc, Weak};
+ use touchHLE_openal_soft_wrapper as al_sys;
+ use touchHLE_openal_soft_wrapper::alc_types::ALCint;
+
+@@ -19,13 +21,54 @@ use al_types::*;
+
+ static OPENALMANAGER_INSTANCE_EXISTS: std::sync::atomic::AtomicBool =
+     std::sync::atomic::AtomicBool::new(false);
+-pub struct OpenALManager {}
++#[derive(Debug)]
++struct ContextVolume {
++    context: *mut ALCcontext,
++    guest_gain: Cell<ALfloat>,
++    muted: Rc<Cell<bool>>,
++}
++impl ContextVolume {
++    fn output_gain(&self) -> ALfloat {
++        if self.muted.get() {
++            0.0
++        } else {
++            self.guest_gain.get()
++        }
++    }
++}
++pub struct OpenALManager {
++    muted: Rc<Cell<bool>>,
++    contexts: Vec<Weak<ContextVolume>>,
++}
+ impl OpenALManager {
+     pub fn new() -> Result<Self, String> {
+         if OPENALMANAGER_INSTANCE_EXISTS.swap(true, std::sync::atomic::Ordering::SeqCst) {
+             return Err("Only one OpenALManager can exist at a time!".to_string());
+         }
+-        Ok(Self {})
++        Ok(Self {
++            muted: Rc::new(Cell::new(false)),
++            contexts: Vec::new(),
++        })
++    }
++    pub fn is_muted(&self) -> bool {
++        self.muted.get()
++    }
++    pub fn set_muted(&mut self, muted: bool) {
++        self.muted.set(muted);
++        unsafe {
++            let previous = al_sys::alcGetCurrentContext();
++            self.contexts.retain(|context| {
++                if let Some(context) = context.upgrade() {
++                    if al_sys::alcMakeContextCurrent(context.context) == ALC_TRUE {
++                        al_sys::alListenerf(AL_GAIN, context.output_gain());
++                    }
++                    true
++                } else {
++                    false
++                }
++            });
++            al_sys::alcMakeContextCurrent(previous);
++        }
+     }
+ }
+
+@@ -41,6 +84,7 @@ pub struct OpenALContext {
+     // We don't need to guarantee the lifetime or thread-safety of the device -
+     // OpenAL (should) do that for us.
+     device: *mut ALCdevice,
++    volume: Rc<ContextVolume>,
+ }
+
+ impl OpenALContext {
+@@ -66,7 +110,21 @@ impl OpenALContext {
+             device,
+             context
+         );
+-        Ok(Self { context, device })
++        let volume = Rc::new(ContextVolume {
++            context,
++            guest_gain: Cell::new(1.0),
++            muted: _manager.muted.clone(),
++        });
++        _manager.contexts.push(Rc::downgrade(&volume));
++        let previous = al_sys::alcGetCurrentContext();
++        al_sys::alcMakeContextCurrent(context);
++        al_sys::alListenerf(AL_GAIN, volume.output_gain());
++        al_sys::alcMakeContextCurrent(previous);
++        Ok(Self {
++            context,
++            device,
++            volume,
++        })
+     }
+
+     pub fn make_current<'al_ctx, 'manager: 'al_ctx>(
+@@ -79,6 +137,7 @@ impl OpenALContext {
+         assert!(ret == ALC_TRUE);
+         OpenAL {
+             _al_lifetime: PhantomData,
++            volume: &self.volume,
+         }
+     }
+
+@@ -109,6 +168,7 @@ impl Drop for OpenALContext {
+
+ pub struct OpenAL<'al_ctx> {
+     _al_lifetime: PhantomData<&'al_ctx ()>,
++    volume: &'al_ctx ContextVolume,
+ }
+
+ impl OpenAL<'_> {
+@@ -139,7 +199,12 @@ impl OpenAL<'_> {
+     }
+
+     pub unsafe fn Listenerf(&self, param: ALenum, value: ALfloat) {
+-        al_sys::alListenerf(param, value)
++        if param == AL_GAIN && value.is_finite() && value >= 0.0 {
++            self.volume.guest_gain.set(value);
++            al_sys::alListenerf(param, self.volume.output_gain());
++        } else {
++            al_sys::alListenerf(param, value)
++        }
+     }
+     pub unsafe fn Listener3f(
+         &self,
+@@ -151,20 +216,36 @@ impl OpenAL<'_> {
+         al_sys::alListener3f(param, value1, value2, value3)
+     }
+     pub unsafe fn Listenerfv(&self, param: ALenum, values: *const ALfloat) {
+-        al_sys::alListenerfv(param, values)
++        if param == AL_GAIN && !values.is_null() {
++            self.Listenerf(param, *values);
++        } else {
++            al_sys::alListenerfv(param, values)
++        }
+     }
+     pub unsafe fn Listeneri(&self, param: ALenum, value: ALint) {
+-        al_sys::alListeneri(param, value)
++        if param == AL_GAIN {
++            self.Listenerf(param, value as ALfloat);
++        } else {
++            al_sys::alListeneri(param, value)
++        }
+     }
+     pub unsafe fn Listener3i(&self, param: ALenum, value1: ALint, value2: ALint, value3: ALint) {
+         al_sys::alListener3i(param, value1, value2, value3)
+     }
+     pub unsafe fn Listeneriv(&self, param: ALenum, values: *const ALint) {
+-        al_sys::alListeneriv(param, values)
++        if param == AL_GAIN && !values.is_null() {
++            self.Listeneri(param, *values);
++        } else {
++            al_sys::alListeneriv(param, values)
++        }
+     }
+
+     pub unsafe fn GetListenerf(&self, param: ALenum, value: *mut ALfloat) {
+-        al_sys::alGetListenerf(param, value)
++        if param == AL_GAIN && !value.is_null() {
++            *value = self.volume.guest_gain.get();
++        } else {
++            al_sys::alGetListenerf(param, value)
++        }
+     }
+     pub unsafe fn GetListener3f(
+         &self,
+@@ -176,10 +257,18 @@ impl OpenAL<'_> {
+         al_sys::alGetListener3f(param, value1, value2, value3)
+     }
+     pub unsafe fn GetListenerfv(&self, param: ALenum, values: *mut ALfloat) {
+-        al_sys::alGetListenerfv(param, values)
++        if param == AL_GAIN && !values.is_null() {
++            *values = self.volume.guest_gain.get();
++        } else {
++            al_sys::alGetListenerfv(param, values)
++        }
+     }
+     pub unsafe fn GetListeneri(&self, param: ALenum, value: *mut ALint) {
+-        al_sys::alGetListeneri(param, value)
++        if param == AL_GAIN && !value.is_null() {
++            *value = self.volume.guest_gain.get() as ALint;
++        } else {
++            al_sys::alGetListeneri(param, value)
++        }
+     }
+     pub unsafe fn GetListener3i(
+         &self,
+@@ -191,7 +280,11 @@ impl OpenAL<'_> {
+         al_sys::alGetListener3i(param, value1, value2, value3)
+     }
+     pub unsafe fn GetListeneriv(&self, param: ALenum, values: *mut ALint) {
+-        al_sys::alGetListeneriv(param, values)
++        if param == AL_GAIN && !values.is_null() {
++            *values = self.volume.guest_gain.get() as ALint;
++        } else {
++            al_sys::alGetListeneriv(param, values)
++        }
+     }
+
+     pub unsafe fn GenSources(&self, n: ALsizei, sources: *mut ALuint) {
+@@ -328,3 +421,62 @@ impl OpenAL<'_> {
+         al_sys::alSpeedOfSound(speed)
+     }
+ }
++
++#[cfg(test)]
++mod host_volume_tests {
++    use super::*;
++    #[test]
++    fn host_mute_updates_existing_and_new_contexts_without_changing_guest_gain() {
++        let mut manager = OpenALManager::new().unwrap();
++        let mut first = OpenALContext::new(&mut manager).unwrap();
++        {
++            let al = first.make_current(&mut manager);
++            unsafe {
++                al.Listenerf(AL_GAIN, 0.4);
++            }
++        }
++        manager.set_muted(true);
++        let mut second = OpenALContext::new(&mut manager).unwrap();
++        for (context, expected) in [(&mut first, 0.4), (&mut second, 1.0)] {
++            let al = context.make_current(&mut manager);
++            let mut physical = -1.0;
++            let mut guest = -1.0;
++            unsafe {
++                al_sys::alGetListenerf(AL_GAIN, &mut physical);
++                al.GetListenerf(AL_GAIN, &mut guest);
++            }
++            assert_eq!(physical, 0.0);
++            assert_eq!(guest, expected);
++        }
++        {
++            let al = first.make_current(&mut manager);
++            unsafe {
++                al.Listenerf(AL_GAIN, 0.7);
++            }
++        }
++        manager.set_muted(false);
++        let _al = first.make_current(&mut manager);
++        let mut physical = -1.0;
++        unsafe {
++            al_sys::alGetListenerf(AL_GAIN, &mut physical);
++        }
++        assert_eq!(physical, 0.7);
++    }
++
++    #[test]
++    fn mute_preserves_guest_gain_and_restores_latest_value() {
++        let muted = Rc::new(Cell::new(false));
++        let state = ContextVolume {
++            context: std::ptr::null_mut(),
++            guest_gain: Cell::new(0.4),
++            muted: muted.clone(),
++        };
++        assert_eq!(state.output_gain(), 0.4);
++        muted.set(true);
++        assert_eq!(state.output_gain(), 0.0);
++        state.guest_gain.set(0.7);
++        assert_eq!(state.output_gain(), 0.0);
++        muted.set(false);
++        assert_eq!(state.output_gain(), 0.7);
++    }
++}
+diff --git a/src/audio/openal_soft_wrapper/lib.rs b/src/audio/openal_soft_wrapper/lib.rs
+index 1629017..3383efe 100644
+--- a/src/audio/openal_soft_wrapper/lib.rs
++++ b/src/audio/openal_soft_wrapper/lib.rs
+@@ -120,6 +120,7 @@ pub mod al_defines {
+     pub const AL_BUFFER: ALenum = 0x1009;
+
+     pub const AL_MAX_GAIN: ALenum = 0x100E;
++    pub const AL_GAIN: ALenum = 0x100A;
+
+     pub const AL_SOURCE_STATE: ALenum = 0x1010;
+
 diff --git a/src/dyld.rs b/src/dyld.rs
 index 71b8d00..b36980f 100644
 --- a/src/dyld.rs
@@ -136,7 +418,7 @@ index 71b8d00..b36980f 100644
      /// encountered during CPU emulation. If `None` is returned, the execution
      /// needs to resume at `svc_pc`.
 diff --git a/src/environment.rs b/src/environment.rs
-index 131c45d..d364561 100644
+index 131c45d..dc5fb38 100644
 --- a/src/environment.rs
 +++ b/src/environment.rs
 @@ -298,11 +298,20 @@ impl Environment {
@@ -189,7 +471,16 @@ index 131c45d..d364561 100644
          let executable = mach_o::MachO::load_from_file(
              bundle.executable_path(),
              &fs,
-@@ -1878,6 +1898,12 @@ impl Environment {
+@@ -689,6 +709,8 @@ impl Environment {
+             panic_cell: Rc::new(Cell::new(None)),
+         };
+
++        crate::sound_settings::initialize(&mut env);
++
+         if env.options.dumping_options.any() {
+             env.dump_file =
+                 Some(std::fs::File::create(&env.options.dumping_file).map_err(|e| e.to_string())?);
+@@ -1878,6 +1900,12 @@ impl Environment {
              .mem
              .alloc_and_write_cstr(self.fs.home_directory().as_str().as_bytes());
          self.env_vars.insert(b"HOME".to_vec(), home_value_cstr);
@@ -2017,18 +2308,21 @@ index 9111ce3..f5de200 100644
 +    }
 +}
 diff --git a/src/frameworks/media_player.rs b/src/frameworks/media_player.rs
-index f848ce9..8fb74bd 100644
+index f848ce9..c896a1d 100644
 --- a/src/frameworks/media_player.rs
 +++ b/src/frameworks/media_player.rs
-@@ -10,6 +10,7 @@ mod media_item_collection;
+@@ -10,8 +10,10 @@ mod media_item_collection;
  mod media_library;
  mod media_picker_controller;
  mod media_playlist;
 +mod media_property_predicate;
  mod media_query;
  mod movie_player;
++pub(crate) use movie_player::set_muted;
  mod music_player;
-@@ -26,8 +27,13 @@ pub const DYLIB: crate::dyld::HostDylib = crate::dyld::HostDylib {
+
+ pub const DYLIB: crate::dyld::HostDylib = crate::dyld::HostDylib {
+@@ -26,8 +28,13 @@ pub const DYLIB: crate::dyld::HostDylib = crate::dyld::HostDylib {
          media_picker_controller::CLASSES,
          media_playlist::CLASSES,
          media_query::CLASSES,
@@ -2322,10 +2616,10 @@ index a1e84ff..ca0e155 100644
 
  @end
 diff --git a/src/frameworks/media_player/movie_player.rs b/src/frameworks/media_player/movie_player.rs
-index 63a782f..584d2e7 100644
+index 63a782f..0fc2fcc 100644
 --- a/src/frameworks/media_player/movie_player.rs
 +++ b/src/frameworks/media_player/movie_player.rs
-@@ -8,17 +8,43 @@
+@@ -8,17 +8,140 @@
  use crate::dyld::{ConstantExports, HostConstant};
  use crate::frameworks::foundation::{ns_string, ns_url, NSInteger, NSTimeInterval};
  use crate::frameworks::uikit::ui_device::UIDeviceOrientation;
@@ -2343,21 +2637,118 @@ index 63a782f..584d2e7 100644
 
 +// All three movies in this game's iPhone bundle use 480x320 at 30 fps.
 +const VIDEO_SIZE: (u32, u32) = (480, 320);
++const VIDEO_FPS: u64 = 30;
 +const FRAME_BYTES: usize = VIDEO_SIZE.0 as usize * VIDEO_SIZE.1 as usize * 4;
 +
 +struct Playback {
 +    video: Child,
-+    audio: Option<Child>,
++    audio: Option<MovieAudio>,
++    audio_data: Arc<Vec<u8>>,
++    frames_received: u64,
++    next_frame: Instant,
 +    frames: mpsc::Receiver<Vec<u8>>,
 +}
 +
 +impl Playback {
++    fn audio_position(&self) -> f64 {
++        // The first presented frame is at time zero. Modal host menus do not
++        // consume frames, so their wall-clock duration must not advance audio.
++        self.frames_received.saturating_sub(1) as f64 / VIDEO_FPS as f64
++    }
++
 +    fn stop(&mut self) {
 +        let _ = self.video.kill();
 +        let _ = self.video.wait();
 +        if let Some(audio) = self.audio.as_mut() {
-+            let _ = audio.kill();
-+            let _ = audio.wait();
++            audio.stop();
++        }
++    }
++}
++
++struct MovieAudio {
++    decoder: Child,
++    player: Child,
++}
++impl MovieAudio {
++    fn stop(&mut self) {
++        let _ = self.player.kill();
++        let _ = self.decoder.kill();
++        let _ = self.player.wait();
++        let _ = self.decoder.wait();
++    }
++}
++impl Drop for MovieAudio {
++    fn drop(&mut self) {
++        self.stop();
++    }
++}
++
++/// Decode forward through pipe input so unmuting can resume at the current video time.
++fn start_audio(data: Arc<Vec<u8>>, position: f64) -> Option<MovieAudio> {
++    let mut decoder = match Command::new("ffmpeg")
++        .args([
++            "-loglevel",
++            "error",
++            "-i",
++            "pipe:0",
++            "-ss",
++            &format!("{position:.3}"),
++            "-vn",
++            "-ac",
++            "2",
++            "-ar",
++            "44100",
++            "-f",
++            "wav",
++            "pipe:1",
++        ])
++        .stdin(Stdio::piped())
++        .stdout(Stdio::piped())
++        .spawn()
++    {
++        Ok(process) => process,
++        Err(error) => {
++            log!("Could not start movie audio decoder: {}", error);
++            return None;
++        }
++    };
++    let input = decoder.stdout.take().unwrap();
++    let player = match Command::new("ffplay")
++        .args([
++            "-loglevel",
++            "error",
++            "-autoexit",
++            "-nodisp",
++            "-vn",
++            "-i",
++            "pipe:0",
++        ])
++        .stdin(Stdio::from(input))
++        .stdout(Stdio::null())
++        .spawn()
++    {
++        Ok(process) => process,
++        Err(error) => {
++            let _ = decoder.kill();
++            let _ = decoder.wait();
++            log!("Movie audio unavailable: {}", error);
++            return None;
++        }
++    };
++    feed_process(&mut decoder, data);
++    Some(MovieAudio { decoder, player })
++}
++
++pub(crate) fn set_muted(env: &mut Environment, muted: bool) {
++    if let Some(playback) = State::get(env).playback.as_mut() {
++        if let Some(mut audio) = playback.audio.take() {
++            audio.stop();
++        }
++        if !muted {
++            playback.audio = start_audio(
++                playback.audio_data.clone(),
++                playback.audio_position(),
++            );
 +        }
 +    }
 +}
@@ -2369,7 +2760,7 @@ index 63a782f..584d2e7 100644
      /// Various apps (e.g. Crash Bandicoot Nitro Kart 3D and Spore Origins)
      /// create or start a player and await some kind of notification, but can't
      /// handle it if that notification happens immediately. This queue lets us
-@@ -32,11 +58,108 @@ impl State {
+@@ -32,11 +155,93 @@ impl State {
      }
  }
 
@@ -2438,33 +2829,18 @@ index 63a782f..584d2e7 100644
 +    });
 +    feed_process(&mut video, data.clone());
 +
-+    let audio = match Command::new("ffplay")
-+        .args([
-+            "-loglevel",
-+            "error",
-+            "-autoexit",
-+            "-nodisp",
-+            "-vn",
-+            "-i",
-+            "pipe:0",
-+        ])
-+        .stdin(Stdio::piped())
-+        .stdout(Stdio::null())
-+        .spawn()
-+    {
-+        Ok(mut process) => {
-+            feed_process(&mut process, data);
-+            Some(process)
-+        }
-+        Err(error) => {
-+            log!("Movie audio unavailable for {:?}: {}", path, error);
-+            None
-+        }
++    let audio = if env.openal_manager.is_muted() {
++        None
++    } else {
++        start_audio(data.clone(), 0.0)
 +    };
 +    log!("Playing movie {:?} in the touchHLE window", path);
 +    Some(Playback {
 +        video,
 +        audio,
++        audio_data: data,
++        frames_received: 0,
++        next_frame: Instant::now(),
 +        frames,
 +    })
 +}
@@ -2478,7 +2854,7 @@ index 63a782f..584d2e7 100644
 
  // Values might not be correct, but as these are linked symbol constants, it
  // shouldn't matter.
-@@ -47,6 +170,10 @@ pub const MPMoviePlayerContentPreloadDidFinishNotification: &str =
+@@ -47,6 +252,10 @@ pub const MPMoviePlayerContentPreloadDidFinishNotification: &str =
      "MPMoviePlayerContentPreloadDidFinishNotification";
  pub const MPMoviePlayerScalingModeDidChangeNotification: &str =
      "MPMoviePlayerScalingModeDidChangeNotification";
@@ -2489,7 +2865,7 @@ index 63a782f..584d2e7 100644
  // TODO: More notifications?
  const MPMoviePlayerPlaybackDidFinishReasonUserInfoKey: &str =
      "MPMoviePlayerPlaybackDidFinishReasonUserInfoKey";
-@@ -65,6 +192,14 @@ pub const CONSTANTS: ConstantExports = &[
+@@ -65,6 +274,14 @@ pub const CONSTANTS: ConstantExports = &[
          "_MPMoviePlayerScalingModeDidChangeNotification",
          HostConstant::NSString(MPMoviePlayerScalingModeDidChangeNotification),
      ),
@@ -2504,7 +2880,7 @@ index 63a782f..584d2e7 100644
      (
          "_MPMoviePlayerPlaybackDidFinishReasonUserInfoKey",
          HostConstant::NSString(MPMoviePlayerPlaybackDidFinishReasonUserInfoKey),
-@@ -74,6 +209,7 @@ pub const CONSTANTS: ConstantExports = &[
+@@ -74,6 +291,7 @@ pub const CONSTANTS: ConstantExports = &[
  struct MPMoviePlayerControllerHostObject {
      // NSURL *
      content_url: id,
@@ -2512,7 +2888,7 @@ index 63a782f..584d2e7 100644
  }
  impl HostObject for MPMoviePlayerControllerHostObject {}
 
-@@ -88,6 +224,7 @@ pub const CLASSES: ClassExports = objc_classes! {
+@@ -88,6 +306,7 @@ pub const CLASSES: ClassExports = objc_classes! {
  + (id)allocWithZone:(NSZonePtr)_zone {
      let host_object = Box::new(MPMoviePlayerControllerHostObject {
          content_url: nil,
@@ -2520,7 +2896,7 @@ index 63a782f..584d2e7 100644
      });
      env.objc.alloc_object(this, host_object, &mut env.mem)
  }
-@@ -138,8 +275,26 @@ pub const CLASSES: ClassExports = objc_classes! {
+@@ -138,8 +357,26 @@ pub const CLASSES: ClassExports = objc_classes! {
  - (())setControlStyle:(MPMovieControlStyle)style {
      todo_objc_setter!(this, style);
  }
@@ -2549,7 +2925,7 @@ index 63a782f..584d2e7 100644
  }
  - (())setInitialPlaybackTime:(NSTimeInterval)initial_time {
      todo_objc_setter!(this, initial_time);
-@@ -150,7 +305,17 @@ pub const CLASSES: ClassExports = objc_classes! {
+@@ -150,7 +387,17 @@ pub const CLASSES: ClassExports = objc_classes! {
  }
 
  - (MPMoviePlaybackState)playbackState {
@@ -2568,7 +2944,7 @@ index 63a782f..584d2e7 100644
  }
 
  // Apparently an undocumented, private API, but Spore Origins uses it.
-@@ -167,7 +332,11 @@ pub const CLASSES: ClassExports = objc_classes! {
+@@ -167,7 +414,11 @@ pub const CLASSES: ClassExports = objc_classes! {
 
  // MPMediaPlayback implementation
  - (())play {
@@ -2581,7 +2957,7 @@ index 63a782f..584d2e7 100644
      if let Some(old) = env.framework_state.media_player.movie_player.active_player {
          let _: () = msg![env; old stop];
      }
-@@ -176,7 +345,15 @@ pub const CLASSES: ClassExports = objc_classes! {
+@@ -176,7 +427,15 @@ pub const CLASSES: ClassExports = objc_classes! {
      retain(env, this);
      env.framework_state.media_player.movie_player.active_player = Some(this);
 
@@ -2598,7 +2974,7 @@ index 63a782f..584d2e7 100644
      // (various apps wait for this, such as BIA and Hero of Sparta).
      let notif = (MPMoviePlayerPlaybackDidFinishNotification, this, Instant::now().checked_add(Duration::from_millis(1000)).unwrap());
      for (name, obj, _) in &mut State::get(env).pending_notifications {
-@@ -195,6 +372,16 @@ pub const CLASSES: ClassExports = objc_classes! {
+@@ -195,6 +454,16 @@ pub const CLASSES: ClassExports = objc_classes! {
 
  - (())stop {
      log!("TODO: [(MPMoviePlayerController*){:?} stop]", this);
@@ -2615,7 +2991,7 @@ index 63a782f..584d2e7 100644
      if env.framework_state.media_player.movie_player.active_player.is_some() {
          // Some applications (like NOVA2) may send 2 `stop` messages for each
          // 1 `play` message for the player. In that case, we want to release
-@@ -226,6 +413,70 @@ pub const CLASSES: ClassExports = objc_classes! {
+@@ -226,6 +495,79 @@ pub const CLASSES: ClassExports = objc_classes! {
  /// For use by `NSRunLoop` via [super::handle_players]: check movie players'
  /// status, send notifications if necessary.
  pub(super) fn handle_players(env: &mut Environment) {
@@ -2630,13 +3006,19 @@ index 63a782f..584d2e7 100644
 +        let mut frames_exhausted = false;
 +        let mut finished = false;
 +        if let Some(playback) = State::get(env).playback.as_mut() {
-+            loop {
++            let now = Instant::now();
++            if now >= playback.next_frame {
 +                match playback.frames.try_recv() {
-+                    Ok(frame) => latest_frame = Some(frame),
-+                    Err(mpsc::TryRecvError::Empty) => break,
++                    Ok(frame) => {
++                        playback.frames_received += 1;
++                        latest_frame = Some(frame);
++                        // Do not fast-forward buffered video after a modal menu.
++                        playback.next_frame = (playback.next_frame
++                            + Duration::from_secs_f64(1.0 / VIDEO_FPS as f64)).max(now);
++                    }
++                    Err(mpsc::TryRecvError::Empty) => {},
 +                    Err(mpsc::TryRecvError::Disconnected) => {
 +                        frames_exhausted = true;
-+                        break;
 +                    }
 +                }
 +            }
@@ -2650,7 +3032,10 @@ index 63a782f..584d2e7 100644
 +                .and_then(|status| status.as_ref())
 +                .is_some_and(|status| !status.success());
 +            let audio_done = playback.audio.as_mut().map_or(true, |audio| {
-+                audio.try_wait().map_or(true, |status| status.is_some())
++                audio
++                    .player
++                    .try_wait()
++                    .map_or(true, |status| status.is_some())
 +            });
 +            finished = video_failed || (frames_exhausted && video_done && audio_done);
 +        }
@@ -2686,6 +3071,37 @@ index 63a782f..584d2e7 100644
      let mut notifs_to_run = Vec::new();
      let pending_notifs = &mut State::get(env).pending_notifications;
      let mut i = 0;
+@@ -245,3 +587,30 @@ pub(super) fn handle_players(env: &mut Environment) {
+         let _: () = msg![env; center postNotificationName:name object:object];
+     }
+ }
++
++#[cfg(test)]
++mod playback_position_tests {
++    use super::*;
++
++    #[test]
++    fn queued_frames_do_not_advance_the_audio_resume_position() {
++        // A harmless child supplies the fields required by Playback; no audio.
++        let video = Command::new(if cfg!(windows) { "cmd" } else { "true" });
++        let mut video = video;
++        if cfg!(windows) { video.args(["/C", "exit", "0"]); }
++        let (sender, frames) = mpsc::channel();
++        let mut playback = Playback {
++            video: video.spawn().unwrap(), audio: None,
++            audio_data: Arc::new(Vec::new()), frames_received: 0, next_frame: Instant::now(), frames,
++        };
++        assert_eq!(playback.audio_position(), 0.0);
++        // Five frames have been consumed, and more queue up while F9 blocks
++        // the consumer. Seek to the displayed frame, not the decoder or clock.
++        playback.frames_received = 5;
++        for _ in 5..60 { sender.send(Vec::new()).unwrap(); }
++        assert_eq!(playback.audio_position(), 4.0 / 30.0);
++        while playback.frames.try_recv().is_ok() { playback.frames_received += 1; }
++        assert_eq!(playback.audio_position(), 59.0 / 30.0);
++        playback.stop();
++    }
++}
 diff --git a/src/frameworks/opengles.rs b/src/frameworks/opengles.rs
 index b00645c..b25d88d 100644
 --- a/src/frameworks/opengles.rs
@@ -3126,7 +3542,7 @@ index 9c86ac4..6420703 100644
 +    }
 +}
 diff --git a/src/frameworks/uikit.rs b/src/frameworks/uikit.rs
-index c8e6773..e9f766f 100644
+index c8e6773..7b44e87 100644
 --- a/src/frameworks/uikit.rs
 +++ b/src/frameworks/uikit.rs
 @@ -12,9 +12,14 @@
@@ -3195,11 +3611,42 @@ index c8e6773..e9f766f 100644
      ui_accelerometer: ui_accelerometer::State,
      ui_application: ui_application::State,
      ui_color: ui_color::State,
-@@ -116,6 +130,19 @@ pub fn handle_events(env: &mut Environment) -> Option<Instant> {
+@@ -107,6 +121,7 @@ pub fn handle_events(env: &mut Environment) -> Option<Instant> {
+     use crate::window::TextInputEvent;
+
+     // NSRunLoop will never call this function in headless mode.
++    sync_8bit_rebellion_keyboard_scheme(env);
+     while let Some(event) = env.window_mut().pop_event() {
+         match event {
+             Event::Quit => {
+@@ -116,6 +131,42 @@ pub fn handle_events(env: &mut Environment) -> Option<Instant> {
              Event::TouchesDown(..) | Event::TouchesMove(..) | Event::TouchesUp(..) => {
                  ui_touch::handle_event(env, event)
              }
-+            Event::ApplyDisplaySettings(settings) => crate::display_settings::apply(env, settings),
++            Event::ShowDisplaySettings => {
++                // Host modal menus suspend video consumption. Stop movie audio
++                // too, then resume from the last presented frame on dismissal.
++                crate::frameworks::media_player::set_muted(env, true);
++                let action = env.on_parent_stack_in_coroutine(|window, options| {
++                    crate::display_settings::show(
++                        window.sdl_window(),
++                        crate::display_settings::Settings::from_options(options),
++                        options.sound_muted,
++                    )
++                });
++                match action {
++                    Some(crate::display_settings::Action::ToggleSound) => {
++                        crate::sound_settings::toggle(env);
++                    }
++                    action => {
++                        if let Some(crate::display_settings::Action::Display(settings)) = action {
++                            crate::display_settings::apply(env, settings);
++                        }
++                        let muted = env.openal_manager.is_muted();
++                        crate::frameworks::media_player::set_muted(env, muted);
++                    }
++                }
++            }
 +            Event::ActivateDoor => activate_8bit_rebellion_door(env),
 +            Event::ToggleGameMenu => toggle_8bit_rebellion_menu(env),
 +            Event::Scroll { cursor, delta } => rebellion_scroll::scroll(
@@ -3215,14 +3662,32 @@ index c8e6773..e9f766f 100644
              Event::AppWillResignActive => {
                  // Getting this event means touchHLE is becoming inactive, e.g.
                  // due to switching apps. The obvious way to handle this would
-@@ -169,5 +196,212 @@ pub fn handle_events(env: &mut Environment) -> Option<Instant> {
+@@ -169,5 +220,230 @@ pub fn handle_events(env: &mut Environment) -> Option<Instant> {
          }
      }
 
++    sync_8bit_rebellion_keyboard_scheme(env);
 +    sync_8bit_rebellion_walk_direction(env);
 +    rebellion_progress::sync_posters(env);
      ui_accelerometer::handle_accelerometer(env)
  }
++
++/// Ask the game's live setting instead of assuming its saved/default scheme.
++fn sync_8bit_rebellion_keyboard_scheme(env: &mut Environment) {
++    if !env.options.keyboard_game_controls
++        || env.bundle.bundle_identifier() != "com.alife.linkinpark"
++        || env.bundle.bundle_version() != "1.4.5"
++        || !env.objc.all_classes().any(|(name, _)| name.as_str() == "AvatarComponent")
++    {
++        return;
++    }
++    let mode: i32 = crate::msg_class![env; AvatarComponent getControlMode];
++    let touch = mode == 1;
++    if env.options.keyboard_touch_controls != touch {
++        log!("Keyboard control scheme: {}", if touch { "Touch" } else { "D-Pad" });
++        env.options.keyboard_touch_controls = touch;
++    }
++}
 +
 +/// Follow DoorEntryComponent's own completed-button path, without relying on
 +/// the on-screen icon's moving position. The field offsets are from the
@@ -4582,14 +5047,15 @@ index 2a140b6..5082e48 100644
 +    }
 +}
 diff --git a/src/lib.rs b/src/lib.rs
-index e616029..4b5c23b 100644
+index e616029..a0615a7 100644
 --- a/src/lib.rs
 +++ b/src/lib.rs
-@@ -32,6 +32,7 @@ mod audio;
+@@ -32,6 +32,8 @@ mod audio;
  mod bundle;
  mod cpu;
  mod debug;
 +mod display_settings;
++mod sound_settings;
  mod dyld;
  mod environment;
  mod font;
@@ -4763,15 +5229,16 @@ index 60b20ca..247c3bc 100644
      /// no such object, or if downcasting fails.
      pub fn borrow<T: AnyHostObject + 'static>(&self, object: id) -> &T {
 diff --git a/src/options.rs b/src/options.rs
-index 7f13c7f..73c2424 100644
+index 7f13c7f..fed4a9c 100644
 --- a/src/options.rs
 +++ b/src/options.rs
-@@ -35,8 +35,12 @@ pub enum Button {
+@@ -35,8 +35,13 @@ pub enum Button {
  #[derive(Clone)]
  pub struct Options {
      pub fullscreen: bool,
 +    pub display_resolution: Option<(u32, u32)>,
 +    pub display_service: bool,
++    pub sound_muted: bool,
      pub device_family: Option<DeviceFamily>,
      pub initial_orientation: DeviceOrientation,
 +    pub landscape_content_layout: bool,
@@ -4779,20 +5246,23 @@ index 7f13c7f..73c2424 100644
      pub scale_hack: NonZeroU32,
      pub deadzone: f32,
      pub analog_stick_tilt_controls: bool,
-@@ -46,6 +50,7 @@ pub struct Options {
+@@ -46,6 +51,9 @@ pub struct Options {
      pub y_tilt_offset: f32,
      pub button_to_touch: HashMap<Button, (f32, f32)>,
      pub dpad_to_touch: Option<(f32, f32, f32, f32)>,
 +    pub keyboard_game_controls: bool,
++    /// Current guest control scheme, refreshed by the 1.4.5 UIKit integration.
++    pub keyboard_touch_controls: bool,
      pub stick_to_touch: Option<(f32, f32, f32, f32)>,
      pub stabilize_virtual_cursor: Option<(f32, f32)>,
      pub gles1_implementation: Option<GLESImplementation>,
-@@ -68,8 +73,12 @@ impl Default for Options {
+@@ -68,8 +76,13 @@ impl Default for Options {
      fn default() -> Self {
          Options {
              fullscreen: false,
 +            display_resolution: None,
 +            display_service: false,
++            sound_muted: false,
              device_family: None,
              initial_orientation: DeviceOrientation::Portrait,
 +            landscape_content_layout: false,
@@ -4800,15 +5270,16 @@ index 7f13c7f..73c2424 100644
              scale_hack: NonZeroU32::new(1).unwrap(),
              analog_stick_tilt_controls: true,
              deadzone: 0.1,
-@@ -79,6 +88,7 @@ impl Default for Options {
+@@ -79,6 +92,8 @@ impl Default for Options {
              y_tilt_offset: 0.0,
              button_to_touch: HashMap::new(),
              dpad_to_touch: None,
 +            keyboard_game_controls: false,
++            keyboard_touch_controls: false,
              stick_to_touch: None,
              stabilize_virtual_cursor: None,
              gles1_implementation: None,
-@@ -122,6 +132,12 @@ impl Options {
+@@ -122,6 +137,12 @@ impl Options {
              self.initial_orientation = DeviceOrientation::LandscapeLeft;
          } else if arg == "--landscape-right" {
              self.initial_orientation = DeviceOrientation::LandscapeRight;
@@ -4822,10 +5293,19 @@ index 7f13c7f..73c2424 100644
              let parsed =
                  DeviceFamily::try_from(value).map_err(|_| "Invalid device family".to_string())?;
 diff --git a/src/paths.rs b/src/paths.rs
-index d0ab20b..e95666f 100644
+index d0ab20b..e500497 100644
 --- a/src/paths.rs
 +++ b/src/paths.rs
-@@ -113,6 +113,10 @@ pub const SANDBOX_DIR: &str = "touchHLE_sandbox";
+@@ -110,9 +110,23 @@ pub const WALLPAPER_FILES: &[&str] = &[
+ /// the `Documents` directory.
+ pub const SANDBOX_DIR: &str = "touchHLE_sandbox";
+
++/// The native macOS launcher supplies an absolute directory outside its bundle.
++#[cfg(any(target_os = "macos", test))]
++fn release_user_data_path(path: Option<std::ffi::OsString>) -> Option<PathBuf> {
++    path.map(PathBuf::from).filter(|path| path.is_absolute())
++}
++
  /// Get a platform-specific base path needed for accessing touchHLE's
  /// user-modifiable files. This is empty on platforms other than Android.
  pub fn user_data_base_path() -> Cow<'static, Path> {
@@ -4833,11 +5313,48 @@ index d0ab20b..e95666f 100644
 +    if let Some(path) = std::env::var_os("BEBELLION_TEST_DATA_DIR") {
 +        return Cow::Owned(PathBuf::from(path));
 +    }
++    #[cfg(target_os = "macos")]
++    if let Some(path) = release_user_data_path(std::env::var_os("BEBELLION_DATA_DIR")) {
++        return Cow::Owned(path);
++    }
      #[cfg(target_os = "android")]
      unsafe {
          // This is an exception to the rule that SDL2 should only be used
+@@ -233,3 +247,32 @@ pub fn prepopulate_user_data_dir() {
+         create_file(&options_help, crate::options::OPTIONS_HELP);
+     }
+ }
++
++#[cfg(test)]
++mod release_path_tests {
++    use super::release_user_data_path;
++    use std::path::PathBuf;
++
++    #[test]
++    fn release_data_path_accepts_absolute_paths_with_spaces() {
++        let path = std::env::temp_dir().join("8-Bit Rebellion! runtime");
++        assert_eq!(
++            release_user_data_path(Some(path.clone().into_os_string())),
++            Some(path)
++        );
++    }
++
++    #[test]
++    fn release_data_path_rejects_relative_or_empty_paths() {
++        assert_eq!(
++            release_user_data_path(Some(PathBuf::from("runtime").into_os_string())),
++            None
++        );
++        assert_eq!(release_user_data_path(Some("".into())), None);
++    }
++
++    #[test]
++    fn missing_release_path_preserves_default_behavior() {
++        assert_eq!(release_user_data_path(None), None);
++    }
++}
 diff --git a/src/window.rs b/src/window.rs
-index d4eae99..eb5987c 100644
+index d4eae99..7a64fa8 100644
 --- a/src/window.rs
 +++ b/src/window.rs
 @@ -18,11 +18,12 @@ use crate::image::Image;
@@ -4915,7 +5432,7 @@ index d4eae99..eb5987c 100644
  }
  pub type Coords = (f32, f32);
 
-@@ -140,6 +181,112 @@ struct DpadState {
+@@ -140,6 +181,127 @@ struct DpadState {
      active: bool,
  }
 
@@ -4965,6 +5482,21 @@ index d4eae99..eb5987c 100644
 +        (false, true) => Some(crate::options::Button::DPadRight),
 +        _ => None,
 +    }
++}
++
++/// Touch mode uses the outer 110-pixel strips for walking and the center
++/// below y=160 for attacking; D-Pad mode uses the configured button centers.
++fn keyboard_button_touch(options: &Options, button: crate::options::Button) -> Option<Coords> {
++    if options.keyboard_touch_controls {
++        use crate::options::Button;
++        match button {
++            Button::DPadLeft => return Some((40.0, 290.0)),
++            Button::DPadRight => return Some((440.0, 290.0)),
++            Button::A => return Some((240.0, 290.0)),
++            _ => {},
++        }
++    }
++    options.button_to_touch.get(&button).copied()
 +}
 +
 +fn starts_door_action(keys: &HashSet<GameKey>, key: GameKey, pressed: bool) -> bool {
@@ -5028,14 +5560,14 @@ index d4eae99..eb5987c 100644
  #[derive(Debug)]
  pub enum TextInputEvent {
      Text(String),
-@@ -160,12 +307,173 @@ pub enum Event {
+@@ -160,12 +322,173 @@ pub enum Event {
      TouchesDown(HashMap<FingerId, Coords>),
      TouchesMove(HashMap<FingerId, Coords>),
      TouchesUp(HashMap<FingerId, Coords>),
 +    /// Activate the visible door entry in 8-Bit Rebellion.
 +    ActivateDoor,
 +    ToggleGameMenu,
-+    ApplyDisplaySettings(crate::display_settings::Settings),
++    ShowDisplaySettings,
 +    Scroll {
 +        cursor: Coords,
 +        delta: f32,
@@ -5202,7 +5734,7 @@ index d4eae99..eb5987c 100644
  pub enum BatteryState {
      Unknown,
      OnBattery,
-@@ -229,13 +537,21 @@ pub struct Window {
+@@ -229,13 +552,21 @@ pub struct Window {
      /// [Self::rotatable_fullscreen] returns [true].
      fullscreen: bool,
      scale_hack: NonZeroU32,
@@ -5224,7 +5756,7 @@ index d4eae99..eb5987c 100644
      stick_active: bool,
      _sensor_ctx: sdl2::SensorSubsystem,
      accelerometer: Option<sdl2::sensor::Sensor>,
-@@ -320,8 +636,9 @@ impl Window {
+@@ -320,8 +651,9 @@ impl Window {
                  .unwrap();
              window
          } else {
@@ -5236,7 +5768,7 @@ index d4eae99..eb5987c 100644
              let window = video_ctx
                  .window(title, width, height)
                  .position_centered()
-@@ -378,8 +695,14 @@ impl Window {
+@@ -378,8 +710,14 @@ impl Window {
              viewport_y_offset: 0,
              fullscreen,
              scale_hack,
@@ -5251,7 +5783,7 @@ index d4eae99..eb5987c 100644
              device_family,
              device_orientation,
              controller_ctx,
-@@ -391,6 +714,8 @@ impl Window {
+@@ -391,6 +729,8 @@ impl Window {
                  down: false,
                  active: false,
              },
@@ -5260,7 +5792,7 @@ index d4eae99..eb5987c 100644
              stick_active: false,
              _sensor_ctx: sensor_ctx,
              accelerometer,
-@@ -449,16 +774,22 @@ impl Window {
+@@ -449,16 +789,22 @@ impl Window {
              } else {
                  window.viewport()
              };
@@ -5293,7 +5825,7 @@ index d4eae99..eb5987c 100644
              // Round to match touch precision of official devices.
              (out_x.round(), out_y.round())
          }
-@@ -542,7 +873,8 @@ impl Window {
+@@ -542,7 +888,8 @@ impl Window {
                  _ => {}
              }
 
@@ -5303,7 +5835,7 @@ index d4eae99..eb5987c 100644
                  E::Quit { .. } => Event::Quit,
                  E::MouseButtonDown {
                      x,
-@@ -571,6 +903,37 @@ impl Window {
+@@ -571,6 +918,37 @@ impl Window {
                      log_dbg!("MouseButtonUp x {}, y {}, coords {:?}", x, y, coords);
                      Event::TouchesUp(HashMap::from([(FingerId::Mouse, coords)]))
                  }
@@ -5341,7 +5873,7 @@ index d4eae99..eb5987c 100644
                  E::ControllerDeviceAdded { which, .. } => {
                      self.controller_added(which);
                      continue;
-@@ -760,6 +1123,9 @@ impl Window {
+@@ -760,6 +1138,9 @@ impl Window {
                      let curr_timestamp = timestamp;
                      let abs_coords = finger_absolute_coords(self, (x, y));
                      let coords = transform_input_coords(self, abs_coords, false);
@@ -5351,7 +5883,7 @@ index d4eae99..eb5987c 100644
                      log_dbg!("Finger event x {}, y {}, coords {:?}", x, y, coords);
                      let mut map = HashMap::from([(FingerId::Touch(finger_id), coords)]);
                      while let Some(next) = self.event_pump.poll_event() {
-@@ -824,6 +1190,160 @@ impl Window {
+@@ -824,6 +1205,154 @@ impl Window {
                      echo!("F12 pressed, EnterDebugger event queued.");
                      Event::EnterDebugger
                  }
@@ -5361,7 +5893,7 @@ index d4eae99..eb5987c 100644
 +                } if options.keyboard_game_controls => {
 +                    let mut touches = HashMap::new();
 +                    if let Some(old) = self.keyboard_direction_active.take() {
-+                        if let Some(&(x, y)) = options.button_to_touch.get(&old) {
++                        if let Some((x, y)) = keyboard_button_touch(options, old) {
 +                            touches.insert(
 +                                FingerId::KeyboardDirection,
 +                                transform_input_coords(self, (x, y), true),
@@ -5369,8 +5901,8 @@ index d4eae99..eb5987c 100644
 +                        }
 +                    }
 +                    if self.keyboard_keys.contains(&GameKey::Space) {
-+                        if let Some(&(x, y)) =
-+                            options.button_to_touch.get(&crate::options::Button::A)
++                        if let Some((x, y)) =
++                            keyboard_button_touch(options, crate::options::Button::A)
 +                        {
 +                            touches.insert(
 +                                FingerId::KeyboardAttack,
@@ -5389,11 +5921,7 @@ index d4eae99..eb5987c 100644
 +                    repeat: false,
 +                    ..
 +                } if options.display_service => {
-+                    let current = crate::display_settings::Settings::from_options(options);
-+                    let Some(settings) = crate::display_settings::show(&self.window, current) else {
-+                        continue;
-+                    };
-+                    Event::ApplyDisplaySettings(settings)
++                    Event::ShowDisplaySettings
 +                }
 +                #[cfg(feature = "rebellion-test-tools")]
 +                E::KeyDown {
@@ -5451,7 +5979,7 @@ index d4eae99..eb5987c 100644
 +                    );
 +
 +                    if key == GameKey::Space {
-+                        let Some(&(x, y)) = options.button_to_touch.get(&crate::options::Button::A)
++                        let Some((x, y)) = keyboard_button_touch(options, crate::options::Button::A)
 +                        else {
 +                            continue;
 +                        };
@@ -5481,10 +6009,8 @@ index d4eae99..eb5987c 100644
 +                        }
 +                        self.keyboard_direction_active = new_direction;
 +                        let touch_for = |this: &Window, button| {
-+                            options
-+                                .button_to_touch
-+                                .get(&button)
-+                                .map(|&(x, y)| transform_input_coords(this, (x, y), true))
++                            keyboard_button_touch(options, button)
++                                .map(|(x, y)| transform_input_coords(this, (x, y), true))
 +                        };
 +                        if let Some(old) = old_direction {
 +                            if let Some(coords) = touch_for(self, old) {
@@ -5512,7 +6038,7 @@ index d4eae99..eb5987c 100644
                  E::KeyDown {
                      keycode: Some(sdl2::keyboard::Keycode::Backspace),
                      ..
-@@ -843,7 +1363,11 @@ impl Window {
+@@ -843,7 +1372,11 @@ impl Window {
                      Event::TextInput(TextInputEvent::Text(text))
                  }
                  _ => continue,
@@ -5525,7 +6051,7 @@ index d4eae99..eb5987c 100644
          }
 
          if controller_updated {
-@@ -868,12 +1392,22 @@ impl Window {
+@@ -868,12 +1401,22 @@ impl Window {
          }
      }
 
@@ -5551,7 +6077,7 @@ index d4eae99..eb5987c 100644
      }
 
      fn controller_added(&mut self, joystick_idx: u32) {
-@@ -1203,12 +1737,18 @@ impl Window {
+@@ -1203,12 +1746,18 @@ impl Window {
 
          // OpenGL ES expects bottom-to-top row order for image data, but our
          // image data will be top-to-bottom. A reflection transform compensates.
@@ -5572,7 +6098,7 @@ index d4eae99..eb5987c 100644
          unsafe {
              let mut gl_ctx = self
                  .internal_gl_ins
-@@ -1265,7 +1805,96 @@ impl Window {
+@@ -1265,7 +1814,96 @@ impl Window {
 
      /// Swap front-buffer and back-buffer so the result of OpenGL rendering is
      /// presented.
@@ -5670,7 +6196,7 @@ index d4eae99..eb5987c 100644
          self.window.gl_swap_window();
      }
 
-@@ -1285,7 +1914,9 @@ impl Window {
+@@ -1285,7 +1923,9 @@ impl Window {
                  set_sdl2_orientation(new_orientation);
                  rotate_fullscreen_size(new_orientation, self.window.size())
              } else {
@@ -5681,7 +6207,7 @@ index d4eae99..eb5987c 100644
              };
 
              // macOS quirk: when resizing the window, the new framebuffer's size
-@@ -1354,6 +1985,57 @@ impl Window {
+@@ -1354,6 +1994,57 @@ impl Window {
          )
      }
 
@@ -5739,7 +6265,7 @@ index d4eae99..eb5987c 100644
      /// Get the region of the on-screen window (x, y, width, height) used to
      /// display the app content.
      ///
-@@ -1362,6 +2044,27 @@ impl Window {
+@@ -1362,6 +2053,27 @@ impl Window {
      pub fn viewport(&self) -> (u32, u32, u32, u32) {
          let (app_width, app_height) =
              size_for_orientation(self.device_family, self.device_orientation, self.scale_hack);
@@ -5767,7 +6293,7 @@ index d4eae99..eb5987c 100644
          if !self.fullscreen && !Self::rotatable_fullscreen() {
              return (0, 0, app_width, app_height);
          }
-@@ -1400,12 +2103,16 @@ impl Window {
+@@ -1400,12 +2112,16 @@ impl Window {
      /// rotating texture co-ordinates to display the image in the window; when
      /// rotating input co-ordinates, invert the matrix.
      pub fn rotation_matrix(&self) -> Matrix<2> {
@@ -5790,7 +6316,7 @@ index d4eae99..eb5987c 100644
      }
 
      pub fn is_screen_saver_enabled(&self) -> bool {
-@@ -1544,3 +2251,30 @@ pub fn get_preferred_country_codes(env: &mut Environment) -> Vec<String> {
+@@ -1544,3 +2260,55 @@ pub fn get_preferred_country_codes(env: &mut Environment) -> Vec<String> {
              .collect()
      })
  }
@@ -5819,6 +6345,31 @@ index d4eae99..eb5987c 100644
 +        "Use in the playable world with movement keys released.\nCoins and posters toggle back to their original values.\nAchievements: one per click, IDs 22000-22015; see the run log.\nRestart the test session to undo all test changes.", Some(window), None) {
 +        Ok(ClickedButton::CustomButton(button)) if button.button_id > 0 => Some(button.button_id as u8),
 +        _ => None,
++    }
++}
++
++#[cfg(test)]
++#[test]
++fn keyboard_targets_follow_live_guest_control_scheme() {
++    use crate::options::Button;
++    let mut options = Options::default();
++    options.button_to_touch.insert(Button::DPadLeft, (40.0, 290.0));
++    options.button_to_touch.insert(Button::DPadRight, (135.0, 290.0));
++    options.button_to_touch.insert(Button::A, (455.0, 290.0));
++    // These are the predicates in AvatarComponent's Touch handler. Right
++    // must reach the right strip; Space must reach the central attack zone.
++    for touch_mode in [false, true, false, true] {
++        options.keyboard_touch_controls = touch_mode;
++        let right = keyboard_button_touch(&options, Button::DPadRight).unwrap();
++        let attack = keyboard_button_touch(&options, Button::A).unwrap();
++        if touch_mode {
++            assert!(right.0 > 480.0 - 110.0 && right.1 > 160.0);
++            assert!(attack.0 >= 110.0 && attack.0 <= 480.0 - 110.0 && attack.1 > 160.0);
++            assert!(keyboard_button_touch(&options, Button::DPadLeft).unwrap().0 < 110.0);
++        } else {
++            assert_eq!(right, (135.0, 290.0));
++            assert_eq!(attack, (455.0, 290.0));
++        }
 +    }
 +}
 diff --git a/tests/TestApp_source/cli_tests.m b/tests/TestApp_source/cli_tests.m
@@ -5866,9 +6417,10 @@ index 651258d..74c200c 100644
 
 diff --git a/src/display_settings.rs b/src/display_settings.rs
 new file mode 100644
+index 0000000..ffc95de
 --- /dev/null
 +++ b/src/display_settings.rs
-@@ -0,0 +1,299 @@
+@@ -0,0 +1,301 @@
 +/*
 + * This Source Code Form is subject to the terms of the Mozilla Public
 + * License, v. 2.0. If a copy of the MPL was not distributed with this
@@ -6025,12 +6577,13 @@ new file mode 100644
 +        }
 +    }
 +}
-+pub fn show(window: &sdl2::video::Window, current: Settings) -> Option<Settings> {
++pub enum Action { Display(Settings), ToggleSound }
++pub fn show(window: &sdl2::video::Window, current: Settings, muted: bool) -> Option<Action> {
 +    let mut pending = current;
 +    loop {
 +        let (w, h) = RESOLUTIONS[pending.resolution];
 +        let summary = format!("Pending: {} x {} | {} | render {}x\nApply changes the current game immediately.\nGame proportions are preserved; wide output has side borders.", w, h, if pending.fullscreen { "Fullscreen" } else { "Windowed" }, pending.scale);
-+        match choose(window, "Display Settings", &summary, &["Cancel", "Resolution", "Window mode", "Render quality", "Reset to defaults", "Apply"]) {
++        match choose(window, "Display Settings", &summary, &["Cancel", "Resolution", "Window mode", "Render quality", "Reset to defaults", "Apply", if muted { "Unmute sound" } else { "Mute sound" }]) {
 +            Some(1) => {
 +                if let Some(index @ 1..=6) = choose(window, "Output resolution", "Choose an output size. Fullscreen uses the desktop display with a centered output area when it fits.", &["Back", "480 x 320 (Original)", "960 x 640", "1280 x 720 (HD)", "1920 x 1080 (Full HD)", "2560 x 1440 (QHD)", "3840 x 2160 (4K)"]) { pending.resolution = index - 1; }
 +            }
@@ -6039,7 +6592,8 @@ new file mode 100644
 +                if let Some(scale @ 1..=4) = choose(window, "Render quality", "Higher scales increase render resolution and GPU work. Original sprites keep their source detail.", &["Back", "1x (Original)", "2x", "3x", "4x"]) { pending.scale = scale as u32; }
 +            }
 +            Some(4) => pending = Settings::default(),
-+            Some(5) => return Some(pending),
++            Some(5) => return Some(Action::Display(pending)),
++            Some(6) => return Some(Action::ToggleSound),
 +            _ => return None,
 +        }
 +    }
@@ -6168,8 +6722,96 @@ new file mode 100644
 +        assert_eq!(fit((3840, 2160), (480, 320)), (300, 0, 3240, 2160));
 +    }
 +}
+diff --git a/src/sound_settings.rs b/src/sound_settings.rs
+new file mode 100644
+index 0000000..940a171
+--- /dev/null
++++ b/src/sound_settings.rs
+@@ -0,0 +1,81 @@
++/*
++ * This Source Code Form is subject to the terms of the Mozilla Public
++ * License, v. 2.0. If a copy of the MPL was not distributed with this
++ * file, You can obtain one at https://mozilla.org/MPL/2.0/.
++ */
++//! Host mute control for all game audio, independent of guest preferences.
++use std::path::PathBuf;
++fn path() -> PathBuf {
++    #[cfg(feature = "rebellion-test-tools")]
++    if let Some(directory) = std::env::var_os("BEBELLION_DISPLAY_SETTINGS_DIR") {
++        return PathBuf::from(directory).join("8beet-sound-settings-v1");
++    }
++    crate::paths::user_data_base_path().join("8beet-sound-settings-v1")
++}
++fn decode(text: &str) -> Option<bool> {
++    match text {
++        "version=1\nmuted=0\n" => Some(false),
++        "version=1\nmuted=1\n" => Some(true),
++        _ => None,
++    }
++}
++pub fn initialize(env: &mut crate::Environment) {
++    if !env.options.display_service {
++        return;
++    }
++    let saved = std::fs::read_to_string(path())
++        .ok()
++        .and_then(|text| decode(&text))
++        .unwrap_or(false);
++    let force_quiet = std::env::var("BEBELLION_MUTE").is_ok_and(|value| value == "1");
++    env.openal_manager.set_muted(saved || force_quiet);
++    env.options.sound_muted = env.openal_manager.is_muted();
++    log!(
++        "Sound at startup: {}",
++        if env.openal_manager.is_muted() {
++            "muted"
++        } else {
++            "on"
++        }
++    );
++}
++pub fn toggle(env: &mut crate::Environment) {
++    if !env.options.display_service {
++        return;
++    }
++    let muted = !env.openal_manager.is_muted();
++    env.openal_manager.set_muted(muted);
++    env.options.sound_muted = muted;
++    crate::frameworks::media_player::set_muted(env, muted);
++    let path = path();
++    let temporary = path.with_extension("tmp");
++    let result = (|| -> std::io::Result<()> {
++        use std::io::Write;
++        let mut file = std::fs::File::create(&temporary)?;
++        write!(file, "version=1\nmuted={}\n", u8::from(muted))?;
++        file.sync_all()?;
++        drop(file);
++        std::fs::rename(temporary, path)
++    })();
++    log!("Sound: {}", if muted { "muted" } else { "on" });
++    if let Err(error) = result {
++        log!("Sound changed but could not be saved: {}", error);
++    }
++}
++#[cfg(test)]
++mod tests {
++    use super::decode;
++    #[test]
++    fn sound_preferences_require_a_valid_version_and_boolean() {
++        assert_eq!(decode("version=1\nmuted=1\n"), Some(true));
++        assert_eq!(decode("version=1\nmuted=0\n"), Some(false));
++        for text in [
++            "version=2\nmuted=1\n",
++            "version=1\nmuted=2\n",
++            "muted=1\n",
++            "version=1\nmuted=1\nextra=0\n",
++        ] {
++            assert_eq!(decode(text), None);
++        }
++    }
++}
 diff --git a/src/frameworks/uikit/rebellion_scroll.rs b/src/frameworks/uikit/rebellion_scroll.rs
 new file mode 100644
+index 0000000..4aae29b
 --- /dev/null
 +++ b/src/frameworks/uikit/rebellion_scroll.rs
 @@ -0,0 +1,118 @@
@@ -6293,6 +6935,7 @@ new file mode 100644
 +}
 diff --git a/src/frameworks/uikit/rebellion_test_tools.rs b/src/frameworks/uikit/rebellion_test_tools.rs
 new file mode 100644
+index 0000000..a8d03c9
 --- /dev/null
 +++ b/src/frameworks/uikit/rebellion_test_tools.rs
 @@ -0,0 +1,242 @@

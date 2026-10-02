@@ -1,0 +1,12 @@
+{
+  "version": "0.3",
+  "architecture": "arm64",
+  "deployment_target": "11.0",
+  "ffmpeg": {
+    "version": "7.1.5",
+    "url": "https://ffmpeg.org/releases/ffmpeg-7.1.5.tar.xz",
+    "sha256": "de668509caf9e35e3cd162473441fdb29538c6d96ed080292b3cf9e6fc5d558f"
+  },
+  "sdl2_commit": "07d0f51fa292895443f563f0cbde4cb3802d87fa",
+  "sdl2_source_sha256": "96e8f65b4dcfaa02698fa6a3c75f74c5196402005e112fec5beb200cd241cb36"
+}

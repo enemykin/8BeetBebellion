@@ -4,21 +4,37 @@
 
 The first binary-release target is **Apple Silicon (arm64, M1 and newer)**. A release should let the player unzip it, add their own decrypted iPhone 1.4.5 IPA, and start the game without installing Rust, Python, Git, CMake, Boost or Homebrew.
 
-This document defines the packaging procedure. **A self-contained release has not been built or validated yet.** The current repository instructions build from source. The existing local touchHLE release binary links only to macOS system libraries/frameworks, but the locally installed Homebrew FFmpeg/ffplay binaries depend on Homebrew libraries and cannot be copied alone into a portable package.
+This document defines the packaging procedure for [prerelease 0.3](https://github.com/enemykin/8BeetBebellion/releases/tag/v0.3). It is ad-hoc signed and is not notarized. The README describes the prebuilt ZIP; [BUILDING.md](BUILDING.md) covers development from source. All four shipped host executables link only to macOS system libraries/frameworks. FFmpeg/ffplay are built from pinned sources with static dependencies, rather than copied from Homebrew.
 
 ## Selected design
 
-Use statically linked FFmpeg libraries and statically linked SDL2 for ffplay. Ship a native **8-Bit Rebellion!.app** in a ZIP for Apple Silicon. The player unpacks the ZIP, places their decrypted IPA in the adjacent input directory, and opens the application. All non-system runtime dependencies are supplied by the package; only macOS frameworks/libraries remain external. Developer ID signing and notarization are part of the intended ordinary first-launch experience.
+Use statically linked FFmpeg libraries and statically linked SDL2 for ffplay. Ship a native **8BeetBebellion.app** in a ZIP for Apple Silicon. The player unpacks the ZIP, places their decrypted IPA in the adjacent input directory, and opens the application. All non-system runtime dependencies are supplied by the package; only macOS frameworks/libraries remain external. Developer ID signing and notarization are part of the intended ordinary first-launch experience.
 
-This is the selected packaging design, not a claim that the finished application has already been built or tested.
+Version 0.3 uses this layout and static media tools. The chosen eight-beet pixel icon is stored in `native/app-icon.png`; the package builder converts it to standard macOS icon sizes and records its source checksum in the build manifest. Its current signature is ad-hoc; a Developer ID identity is not installed on the build Mac. The native launcher and source builds have been checked locally, but a second clean Mac and older macOS versions remain unverified.
+
+## Build version 0.3
+
+On a native Apple Silicon Mac, first prepare the patched touchHLE checkout using [BUILDING.md](BUILDING.md). Install `pkg-config` as an additional build-time tool. Then run from the project root:
+
+```bash
+CMAKE_POLICY_VERSION_MINIMUM=3.5 cargo build --manifest-path vendor/touchHLE/Cargo.toml --release --locked
+python3 scripts/build_media.py
+python3 scripts/package_macos.py --sources
+```
+
+`config/release.json` pins the release version, FFmpeg archive checksum, SDL2 revision/source fingerprint, architecture and deployment target. Media build logs are under `build/media/`. Output assets are `build/releases/8BeetBebellion-0.3-macos-arm64.zip`, `8BeetBebellion-0.3-sources.tar.gz` and `SHA256SUMS`. The assembled application is under `build/package-staging/`. All are ignored by Git.
+
+The package builder audits host Mach-O dependencies and rejects non-system libraries and runtime search paths. It collects licenses and corresponding sources, creates empty input/runtime/reports directories, and signs the package ad-hoc. It never reads the user's input directory. `launcher --check` checks package files and IPA selection without starting the game. Runtime startup accepts a single arbitrarily named IPA, or the documented default name if several are present. F9 includes a persistent Mute sound / Unmute sound button for game and cutscene audio. For quiet development checks, set `BEBELLION_MUTE=1` when starting the native launcher; it forces OpenAL's null backend and SDL's dummy audio driver so even an unmute test cannot disturb other work.
+
+The build deployment target is macOS 11.0. This is not a compatibility claim: local runtime checks are on macOS 26.6.2. Developer ID signing, notarization and clean-device checks below remain pending before a stable release.
 
 ## Package contents
 
 Use an explicit allowlist when assembling a new, empty staging directory under the ignored build directory:
 
 ```text
-8BeetBebellion-macos-arm64/
-  8-Bit Rebellion!.app/
+8BeetBebellion-0.3-macos-arm64/
+  8BeetBebellion.app/
     Contents/
       Info.plist
       MacOS/

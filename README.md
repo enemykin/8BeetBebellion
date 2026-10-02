@@ -26,19 +26,19 @@ See [CHANGELOG](CHANGELOG.md), the detailed [compatibility log](docs/COMPATIBILI
 
 ## Set up on a new Mac
 
-**Release status:** the self-contained Apple Silicon package is planned, but has not been built, validated or published yet. The steps below describe the intended release package. To run the game today, follow [the macOS source build instructions](docs/BUILDING.md). The packaging plan is documented in [the release preparation guide](docs/RELEASING.md).
+Version **0.3** is available as an [Apple Silicon prerelease](https://github.com/enemykin/8BeetBebellion/releases/tag/v0.3) for **M1 and newer Macs**. The package includes all non-system runtime dependencies; you supply your own **decrypted iPhone version 1.4.5 IPA**, bundle ID `com.alife.linkinpark`.
 
-The release will target **Apple Silicon Macs (M1 and newer)**. Its release notes will specify the tested macOS versions and signing/notarization status. You will need only the unpacked package and your own **decrypted iPhone version 1.4.5 IPA**, bundle ID `com.alife.linkinpark`.
+**Signing and compatibility:** this prerelease is ad-hoc signed, without Developer ID signing or Apple notarization. macOS may block the downloaded application; a warning-free first launch is not yet supported. Runtime testing is on macOS **26.6.2**. The build targets macOS 11.0, but older versions and a second clean Mac remain unverified.
 
 ### 1. Download and unpack the release
 
-Once available, download the **macOS arm64 release ZIP** from [GitHub Releases](https://github.com/enemykin/8BeetBebellion/releases) and unpack it in a writable folder. GitHub's **Code → Download ZIP** and the automatic **Source code** archives contain source files and require the build steps linked above.
+Download [**8BeetBebellion-0.3-macos-arm64.zip**](https://github.com/enemykin/8BeetBebellion/releases/download/v0.3/8BeetBebellion-0.3-macos-arm64.zip) and unpack it in a writable folder. GitHub's **Code → Download ZIP** and the automatic **Source code** archives require compilation. For development, follow [the macOS source build instructions](docs/BUILDING.md); [the release preparation guide](docs/RELEASING.md) describes packaging.
 
-Keep the unpacked folder together. The planned layout includes:
+Keep the unpacked folder together:
 
 ```text
-8BeetBebellion-macos-arm64/
-  8-Bit Rebellion!.app
+8BeetBebellion-0.3-macos-arm64/
+  8BeetBebellion.app
   input/
   reports/
   runtime/
@@ -47,23 +47,23 @@ Keep the unpacked folder together. The planned layout includes:
   BUILD-MANIFEST.json
 ```
 
-The application will include the patched touchHLE emulator, its resources, and FFmpeg/ffplay with their required libraries. Players will not need to install Python, Git, Rust/Cargo, CMake, Boost or Homebrew, or compile anything. Cutscene video and audio tools will be included in the package.
+The application includes the patched touchHLE emulator, its resources, and static FFmpeg/ffplay for cutscenes. You do not need Python, Git, Rust/Cargo, CMake, Boost or Homebrew to run the package.
 
 ### 2. Add your IPA
 
-Place your own decrypted IPA in the unpacked package's `input/` folder and name it:
+Place your own decrypted IPA in the unpacked package's `input/` folder. A single IPA can keep its filename. If several IPA files are present, name the intended one:
 
 ```text
 8Bit Rebellion v1.4.5.ipa
 ```
 
-Use the currently supported **iPhone version 1.4.5**. Support for the iPad edition is planned in [the roadmap](docs/ROADMAP.md). The release will not contain or download the game, its music or its artwork.
+Use the currently supported **iPhone version 1.4.5**. Support for the iPad edition is planned in [the roadmap](docs/ROADMAP.md). The release does not contain or download the game, its music or its artwork.
 
 ### 3. Start the game
 
-Double click **8-Bit Rebellion!.app** in the unpacked folder. No Terminal commands or dependency installation will be needed for the intended release package.
+Double click **8BeetBebellion.app** in the unpacked folder. The launcher uses the bundled executables.
 
-The launcher will read the IPA from `input/`, write startup logs to `reports/`, and keep saves and display preferences in `runtime/`, outside the application bundle. Keep these folders with the application when moving the package. A fresh package on another Mac starts a new campaign unless you transfer your existing offline saves.
+The launcher reads the IPA from `input/`, writes startup logs to `reports/`, and keeps saves and display preferences in `runtime/`, outside the application bundle. Keep these folders with the application when moving the package. A fresh package on another Mac starts a new campaign unless you transfer your existing offline saves.
 
 ### Controls
 
@@ -79,13 +79,13 @@ The launcher will read the IPA from `input/`, write startup logs to `reports/`, 
 
 On macOS, scrolling reads the Natural scrolling preference at startup. Restart the game after changing that system setting.
 
-Letter keys use physical key positions, including under English and Russian layouts. Door activation follows the game's own command and does not depend on mouse position. Game-specific commands and save compatibility fixes are restricted to the inspected 1.4.5 bundle.
+Keyboard movement and attack follow the game's current **Control: Touch / D-Pad** setting, including changes made during a session. Letter keys use physical key positions, including under English and Russian layouts. Door activation follows the game's own command and does not depend on mouse position. Game-specific commands and save compatibility fixes are restricted to the inspected 1.4.5 bundle.
 
 ## Display settings
 
-Press **F9** to choose output size (480×320 Original, 960×640, HD, Full HD, QHD or 4K), windowed/fullscreen mode, and internal render scale (1×–4×). **Apply** updates the current game immediately and saves the selection for future launches. **Cancel** discards pending edits, including Reset to defaults. The original game proportions remain 3:2, with borders inside wider output. Higher render scales do not add detail to source sprites.
+Press **F9** to mute/unmute all game audio or choose output size (480×320 Original, 960×640, HD, Full HD, QHD or 4K), windowed/fullscreen mode, and internal render scale (1×–4×). **Apply** updates the current game immediately and saves the selection for future launches. **Cancel** discards pending edits, including Reset to defaults. The original game proportions remain 3:2, with borders inside wider output. Higher render scales do not add detail to source sprites.
 
-Windowed presets size the SDL output surface; macOS can scale the window for Retina display. Fullscreen uses the desktop mode with the selected output centered, shrinking it to fit if needed. The configuration is `8beet-display-settings-v1` in touchHLE's user data directory (normally `vendor/touchHLE` for the local launcher). Display preferences are shared by the normal and test launchers; offline game saves remain isolated in test sessions. Changing output size, window mode or render scale does not restart the game.
+Windowed presets size the SDL output surface; macOS can scale the window for Retina display. Fullscreen uses the desktop mode with the selected output centered, shrinking it to fit if needed. The configuration is `8beet-display-settings-v1` in touchHLE's user data directory (`runtime/` beside the packaged application; `vendor/touchHLE` for the source launcher). Display preferences are shared by the normal and test launchers; offline game saves remain isolated in test sessions. Changing output size, window mode or render scale does not restart the game. **Mute sound / Unmute sound** takes effect immediately, including music, effects and the current cutscene; it closes the menu and discards pending display edits. The sound choice persists in `8beet-sound-settings-v1` for future launches.
 
 ## Repository layout
 
@@ -106,6 +106,6 @@ Start Bebellion.command             macOS launcher
 
 This project runs a user-owned, decrypted copy of the original game through a patched touchHLE emulator. The supported goal is the offline single-player campaign; multiplayer and access to online accounts or services are not implemented. The game and its content belong to their respective rights holders and are supplied separately by the player.
 
-The planned Apple Silicon release will bundle touchHLE, its support libraries and fonts, and FFmpeg/ffplay for cutscenes. These components retain their own licenses and upstream attribution. touchHLE source is licensed under MPL-2.0; upstream distributes its binaries under GPL-3.0-or-later because of dependency license compatibility. FFmpeg's applicable license depends on the exact build configuration.
+The Apple Silicon release bundles touchHLE, its support libraries and fonts, and FFmpeg/ffplay for cutscenes. These components retain their own licenses and upstream attribution. touchHLE source is licensed under MPL-2.0; upstream distributes its binaries under GPL-3.0-or-later because of dependency license compatibility. The bundled FFmpeg/ffplay build uses LGPL-2.1-or-later, with GPL and nonfree options disabled.
 
-Binary releases will include applicable license texts and notices in `licenses/`, plus a separate matching source archive with dependency sources, patches and build instructions. The repository's automatic source ZIP is not a substitute for that archive. See [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md) for component attribution and [the release preparation guide](docs/RELEASING.md) for packaging requirements. No self-contained binary release has been published yet.
+Release assets include applicable license texts and notices in `licenses/`, plus a separate matching source archive with dependency sources, patches and build instructions. The repository's automatic source ZIP is not a substitute for that archive. See [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md) for component attribution and [the release preparation guide](docs/RELEASING.md) for packaging requirements. Download the matching binary ZIP, corresponding-source archive and `SHA256SUMS` from [release 0.3](https://github.com/enemykin/8BeetBebellion/releases/tag/v0.3).

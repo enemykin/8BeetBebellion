@@ -1,6 +1,6 @@
 # Third-party notices
 
-This document identifies third-party components used by the project and planned for its self-contained Apple Silicon release. **No self-contained binary package has been published yet.** The current repository distributes project tools, documentation and a compatibility patch; upstream sources and local build output are not included.
+This document identifies third-party components used by the project and its self-contained Apple Silicon release. **Version 0.3 is an ad-hoc signed prerelease, without Apple notarization.** The repository distributes project tools, documentation and a compatibility patch; binary packages and matching upstream/dependency sources are separate GitHub Release assets.
 
 ## touchHLE and its dependencies
 
@@ -20,7 +20,7 @@ The pinned source's `src/licenses.rs`, generated dependency notices, and individ
 
 ## FFmpeg, ffplay and SDL2
 
-Current source builds use separately installed FFmpeg and ffplay. The planned release will bundle builds from pinned sources, with static FFmpeg libraries and static SDL2 for ffplay, leaving only macOS system dependencies.
+Source launches can use separately installed FFmpeg and ffplay. Release 0.3 bundles FFmpeg/ffplay 7.1.5 with static libraries and SDL2 2.26.4 at commit `07d0f51fa292895443f563f0cbde4cb3802d87fa`, leaving only macOS system dependencies. GPL and nonfree FFmpeg options are disabled; these media binaries use LGPL-2.1-or-later. Exact flags and source checksums are in the build manifest.
 
 [FFmpeg's licensing guidance](https://ffmpeg.org/legal.html) explains that its default license is LGPL-2.1-or-later, with GPL terms applying when GPL components are enabled. The final notices must state the actual versions, configuration and applicable license for each shipped build. A build configured with `--enable-nonfree` must not be distributed.
 
@@ -34,4 +34,4 @@ A repository ZIP containing only the compatibility patch is not the complete cor
 
 ## Game content
 
-Linkin Park 8-Bit Rebellion! and its game content belong to their respective rights holders. Neither the repository nor the planned binary or source release includes IPA files, decrypted game executables, artwork, music, extracted game resources or user saves. Players supply their own decrypted application locally. Licenses for the emulator and video tools do not grant rights to redistribute the game.
+Linkin Park 8-Bit Rebellion! and its game content belong to their respective rights holders. Neither the repository nor the binary or source release includes IPA files, decrypted game executables, artwork, music, extracted game resources or user saves. Players supply their own decrypted application locally. Licenses for the emulator and video tools do not grant rights to redistribute the game.

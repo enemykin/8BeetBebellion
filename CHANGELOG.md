@@ -2,6 +2,18 @@
 
 All entries in this file and the detailed compatibility log must be maintained in English. See [docs/COMPATIBILITY_LOG.md](docs/COMPATIBILITY_LOG.md) for the chronological investigation and local evidence references.
 
+## 0.3 — prerelease (2026-10-02)
+
+- Embed the selected original pixel-art icon with eight beetroots, including standard macOS icon sizes and its source artwork.
+- Package a native Apple Silicon **8BeetBebellion.app** with touchHLE resources and static FFmpeg/ffplay 7.1.5 plus SDL2, without Python or Homebrew requirements at runtime.
+- Follow the live Touch/D-Pad setting for keyboard movement and attack, including switching schemes without restarting.
+- Keep logs in adjacent `reports/` and saves/preferences in `runtime/`; accept a single user-supplied IPA without renaming it and prevent concurrent sessions sharing saves.
+- Provide matching patched emulator/native/Cargo/media sources, component notices, a build manifest and SHA-256 sums; exclude game content and user data from all assets.
+- Resume cutscene audio from the displayed frame after F9 and pace queued video frames without fast-forwarding; exclude Finder metadata from release archives.
+- Add an immediate F9 Mute sound / Unmute sound button for music, effects and cutscenes, with persistent preferences and a silent testing override.
+- Validate 74 touchHLE library tests in each ordinary/test configuration, 9 project tests, no-IPA handling, paths with spaces and generated video/audio fixtures with a restricted PATH.
+- This prerelease is ad-hoc signed only. Developer ID signing, notarization and a second clean-Mac check remain pending. The build target is macOS 11.0; local runtime testing is on macOS 26.6.2.
+
 ## 2026-10-02
 
 - Keep unsaved poster progress pending after a failed write, retry without requiring another poster, and retain pending IDs across mission transitions.
