@@ -1,3 +1,16 @@
+diff --git a/Cargo.toml b/Cargo.toml
+index 576e6fe..f153eca 100644
+--- a/Cargo.toml
++++ b/Cargo.toml
+@@ -27,6 +27,8 @@ name = "touchHLE"
+ path = "src/bin.rs"
+
+ [features]
++# Local test tools are compiled out of ordinary builds.
++rebellion-test-tools = []
+ default = ["static"]
+ static = ["sdl2/bundled", "sdl2/static-link", "touchHLE_openal_soft_wrapper/static"]
+
 diff --git a/OPTIONS_HELP.txt b/OPTIONS_HELP.txt
 index 9297a5f..c270df9 100644
 --- a/OPTIONS_HELP.txt
@@ -5,7 +18,7 @@ index 9297a5f..c270df9 100644
 @@ -22,6 +22,16 @@ View options:
          and it will automatically rotate the window, but some apps neglect to
          do this. These options may be useful in that case.
- 
+
 +    --landscape-content-layout
 +        Use landscape bounds for UIKit and EAGL content, without rotating the
 +        view controller again. Also correct a portrait-sized orthographic
@@ -22,7 +35,7 @@ index 9297a5f..c270df9 100644
 @@ -166,6 +176,14 @@ Game controller options:
          right analog stick (tap/hold by pressing the stick or right shoulder
          button).
- 
+
 +    --keyboard-game-controls
 +        Maps physical A/Left and D/Right keys to the DPadLeft and DPadRight
 +        touch points, Space to the A touch point, W/Up to the visible door
@@ -47,7 +60,7 @@ index 71b8d00..b36980f 100644
 +    linked_host_constants: HashMap<&'static str, ConstVoidPtr>,
      non_lazy_host_functions: HashMap<&'static str, GuestFunction>,
  }
- 
+
 @@ -260,6 +261,7 @@ impl Dyld {
              return_to_host_routine: None,
              thread_exit_routine: None,
@@ -69,7 +82,7 @@ index 71b8d00..b36980f 100644
 +                self.constants_to_link_later.push((ptr_ptr, symbol));
                  continue;
              }
- 
+
 @@ -607,27 +608,35 @@ impl Dyld {
      /// Do linking that can only be done once there is a full [Environment].
      /// Not to be confused with lazy linking.
@@ -96,7 +109,7 @@ index 71b8d00..b36980f 100644
              env.mem.write(symbol_ptr_ptr, symbol_ptr.cast());
          }
      }
- 
+
 +    /// Return the address of an exported constant's storage in guest memory.
 +    /// Non-lazy relocations and dlsym() must see the same address.
 +    pub fn get_constant_address(env: &mut Environment, symbol: &str) -> Option<ConstVoidPtr> {
@@ -123,10 +136,10 @@ index 71b8d00..b36980f 100644
      /// encountered during CPU emulation. If `None` is returned, the execution
      /// needs to resume at `svc_pc`.
 diff --git a/src/environment.rs b/src/environment.rs
-index 131c45d..1be9cac 100644
+index 131c45d..d364561 100644
 --- a/src/environment.rs
 +++ b/src/environment.rs
-@@ -298,7 +298,7 @@ impl Environment {
+@@ -298,11 +298,20 @@ impl Environment {
      /// Loads the binary and sets up the emulator.
      pub fn new(
          bundle: bundle::Bundle,
@@ -135,7 +148,20 @@ index 131c45d..1be9cac 100644
          mut options: options::Options,
          app_args: Vec<String>,
      ) -> Result<Environment, String> {
-@@ -425,8 +425,14 @@ impl Environment {
+         let startup_time = Instant::now();
++        if bundle.bundle_identifier() == "com.alife.linkinpark"
++            && bundle.bundle_version() == "1.4.5"
++        {
++            if let Some(settings) = crate::display_settings::load_saved() {
++                settings.apply(&mut options);
++                log!("Display preferences at startup: {:?}", settings);
++            }
++            options.display_service = true;
++        }
+
+         // Enforces the one (real) Environment limit. See `with_yielder` for
+         // why this is needed.
+@@ -425,8 +434,14 @@ impl Environment {
              || bundle
                  .bundle_identifier()
                  .starts_with("com.go.starwave.CritterCrunch");
@@ -151,7 +177,7 @@ index 131c45d..1be9cac 100644
          if is_spore {
              log!("Applying game-specific hack for Spore Origins: zeroing memory on alloc instead of free.");
          }
-@@ -435,6 +441,11 @@ impl Environment {
+@@ -435,6 +450,11 @@ impl Environment {
              // the game crashes with a null page access error.
              log!("Applying game-specific hack for Critter Crunch: zeroing memory on alloc instead of free.");
          }
@@ -163,7 +189,7 @@ index 131c45d..1be9cac 100644
          let executable = mach_o::MachO::load_from_file(
              bundle.executable_path(),
              &fs,
-@@ -1878,6 +1889,12 @@ impl Environment {
+@@ -1878,6 +1898,12 @@ impl Environment {
              .mem
              .alloc_and_write_cstr(self.fs.home_directory().as_str().as_bytes());
          self.env_vars.insert(b"HOME".to_vec(), home_value_cstr);
@@ -174,7 +200,7 @@ index 131c45d..1be9cac 100644
 +        let tmp_value_cstr = self.mem.alloc_and_write_cstr(tmp_dir.as_str().as_bytes());
 +        self.env_vars.insert(b"TMPDIR".to_vec(), tmp_value_cstr);
      }
- 
+
      fn get_sorted_bin_indices(&self) -> Result<Vec<usize>, String> {
 diff --git a/src/frameworks/audio_toolbox/extended_audio_file.rs b/src/frameworks/audio_toolbox/extended_audio_file.rs
 index f973abf..d66d00f 100644
@@ -185,13 +211,13 @@ index f973abf..d66d00f 100644
  const kExtAudioFileProperty_FileDataFormat: ExtAudioFilePropertyID = fourcc(b"ffmt");
  const kExtAudioFileProperty_ClientDataFormat: ExtAudioFilePropertyID = fourcc(b"cfmt");
 +const kExtAudioFileProperty_FileLengthFrames: ExtAudioFilePropertyID = fourcc(b"#frm");
- 
+
  fn ExtAudioFileOpenURL(
      env: &mut Environment,
 @@ -111,6 +112,32 @@ fn ExtAudioFileGetProperty(
  ) -> OSStatus {
      return_if_null!(in_ext_audio_file);
- 
+
 +    if in_property_id == kExtAudioFileProperty_FileLengthFrames {
 +        if env.mem.read(io_property_data_size) != guest_size_of::<i64>() {
 +            return kAudioFileBadPropertySizeError;
@@ -221,6 +247,18 @@ index f973abf..d66d00f 100644
      let audio_file_property_id = match in_property_id {
          kExtAudioFileProperty_FileDataFormat => kAudioFilePropertyDataFormat,
          _ => unimplemented!(
+diff --git a/src/frameworks/core_animation.rs b/src/frameworks/core_animation.rs
+index 2e9b52a..022729b 100644
+--- a/src/frameworks/core_animation.rs
++++ b/src/frameworks/core_animation.rs
+@@ -70,3 +70,7 @@ pub fn CACurrentMediaTime(env: &mut Environment) -> CFTimeInterval {
+ }
+
+ pub const FUNCTIONS: FunctionExports = &[export_c_func!(CACurrentMediaTime())];
++
++pub(crate) fn invalidate_display_target(env: &mut crate::Environment) {
++    composition::invalidate_display_target(env);
++}
 diff --git a/src/frameworks/core_animation/ca_layer.rs b/src/frameworks/core_animation/ca_layer.rs
 index b58cb8c..20ffe7e 100644
 --- a/src/frameworks/core_animation/ca_layer.rs
@@ -228,7 +266,7 @@ index b58cb8c..20ffe7e 100644
 @@ -68,6 +68,97 @@ pub(super) struct CALayerHostObject {
  }
  impl HostObject for CALayerHostObject {}
- 
+
 +fn landscape_frame_for_portrait_layer(
 +    bounds: CGRect,
 +    mut frame: CGRect,
@@ -326,14 +364,14 @@ index b58cb8c..20ffe7e 100644
 @@ -439,6 +530,8 @@ pub const CLASSES: ClassExports = objc_classes! {
          return;
      }
- 
+
 +    fit_fullscreen_layers_to_landscape(env, this);
 +
      let &mut CALayerHostObject {
          cg_context,
          ref mut gles_texture_is_up_to_date,
 diff --git a/src/frameworks/core_animation/composition.rs b/src/frameworks/core_animation/composition.rs
-index 8470613..01f5b38 100644
+index 8470613..edf459d 100644
 --- a/src/frameworks/core_animation/composition.rs
 +++ b/src/frameworks/core_animation/composition.rs
 @@ -13,8 +13,9 @@
@@ -354,11 +392,11 @@ index 8470613..01f5b38 100644
 +use crate::window::DeviceOrientation;
  use crate::Environment;
  use std::time::{Duration, Instant};
- 
+
 @@ -56,6 +58,54 @@ unsafe fn load_matrix(gles: &mut dyn GLES, matrix: Matrix<4>) {
      gles.LoadMatrixf(matrix.columns().as_ptr() as *const _);
  }
- 
+
 +/// Present portrait launch artwork in a fixed landscape layout without
 +/// resizing its pixels or changing the guest's view geometry.
 +fn landscape_launch_image_geometry(
@@ -422,11 +460,11 @@ index 8470613..01f5b38 100644
 +        },
          env.window().virtual_cursor_visible_at(),
      );
- 
+
 @@ -423,6 +477,25 @@ unsafe fn composite_layer_recursive(
          return;
      }
- 
+
 +    let launch_image_modelview = if env.options.landscape_content_layout && host_obj.contents != nil
 +    {
 +        let image = cg_image::borrow_image(&env.objc, host_obj.contents);
@@ -448,7 +486,7 @@ index 8470613..01f5b38 100644
 +
      let window = env.window.as_mut().unwrap();
      let mut gles = window.make_internal_gl_ctx_current();
- 
+
 @@ -440,9 +513,11 @@ unsafe fn composite_layer_recursive(
          gles.MatrixMode(gles11::MODELVIEW);
          load_matrix(
@@ -462,11 +500,11 @@ index 8470613..01f5b38 100644
 +                    .multiply(&cumulative_transform)
 +            }),
          );
- 
+
          cumulative_transform
 @@ -611,11 +686,11 @@ unsafe fn composite_layer_recursive(
          gles.VertexPointer(2, gles11::FLOAT, 0, 0 as *const GLvoid);
- 
+
          gles.EnableClientState(gles11::TEXTURE_COORD_ARRAY);
 -        // Normal images will have top-to-bottom row order, but OpenGL ES
 -        // expects bottom-to-top, so flip the UVs in that case.
@@ -479,7 +517,7 @@ index 8470613..01f5b38 100644
                  misc.basic_square_buffer
              } else {
                  misc.flipped_square_buffer
-@@ -729,3 +804,131 @@ unsafe fn upload_rgba8_pixels(gles: &mut dyn GLES, pixels: &[u8], dimensions: (u
+@@ -729,3 +804,151 @@ unsafe fn upload_rgba8_pixels(gles: &mut dyn GLES, pixels: &[u8], dimensions: (u
          gles11::LINEAR as _,
      );
  }
@@ -611,6 +649,26 @@ index 8470613..01f5b38 100644
 +        );
 +    }
 +}
++
++pub(super) fn invalidate_display_target(env: &mut Environment) {
++    if let Some((texture, framebuffer)) = env
++        .framework_state
++        .core_animation
++        .composition
++        .texture_framebuffer
++        .take()
++    {
++        let mut gl = env.window.as_mut().unwrap().make_internal_gl_ctx_current();
++        unsafe {
++            gl.DeleteTextures(1, &texture);
++            gl.DeleteFramebuffersOES(1, &framebuffer);
++        }
++    }
++    env.framework_state
++        .core_animation
++        .composition
++        .recomposite_next = None;
++}
 diff --git a/src/frameworks/core_foundation.rs b/src/frameworks/core_foundation.rs
 index 205be44..17c8281 100644
 --- a/src/frameworks/core_foundation.rs
@@ -704,7 +762,7 @@ index 118e7f6..3ec75ee 100644
 +            ref clip_regions,
              ..
          } = objc.borrow(context);
- 
+
 @@ -437,6 +440,7 @@ impl CGBitmapContextDrawer<'_> {
              rgb_fill_color,
              blend_mode,
@@ -732,7 +790,7 @@ index 118e7f6..3ec75ee 100644
 @@ -528,6 +541,41 @@ impl CGBitmapContextDrawer<'_> {
      }
  }
- 
+
 +fn point_is_in_clip(point: CGPoint, regions: &[(CGRect, CGAffineTransform)]) -> bool {
 +    regions.iter().all(|(rect, transform)| {
 +        let point = transform.invert().apply_to_point(point);
@@ -782,7 +840,7 @@ index 118e7f6..3ec75ee 100644
 @@ -638,6 +687,41 @@ pub(super) fn fill_rect(env: &mut Environment, context: CGContextRef, rect: CGRe
      }
  }
- 
+
 +/// Fill an ellipse in user coordinates, subject to the context's CTM and clip.
 +pub(super) fn fill_ellipse(env: &mut Environment, context: CGContextRef, rect: CGRect) {
 +    if rect.size.width <= 0.0 || rect.size.height <= 0.0 {
@@ -827,7 +885,7 @@ index 897e267..208a460 100644
 +++ b/src/frameworks/core_graphics/cg_context.rs
 @@ -6,15 +6,12 @@
  //! `CGContext.h`
- 
+
  use super::cg_affine_transform::{CGAffineTransform, CGAffineTransformIdentity};
 -use super::cg_bitmap_context::{
 -    CGBitmapContextDrawer, CGBitmapContextGetHeight, CGBitmapContextGetWidth,
@@ -848,7 +906,7 @@ index 897e267..208a460 100644
      CGBlendMode,                          // blend mode
 +    Vec<(CGRect, CGAffineTransform)>,     // clipping rectangles and their CTMs
  );
- 
+
  pub(super) struct CGContextHostObject {
 @@ -83,6 +81,7 @@ pub(super) struct CGContextHostObject {
      pub(super) blend_mode: CGBlendMode,
@@ -861,7 +919,7 @@ index 897e267..208a460 100644
 @@ -204,24 +203,17 @@ pub fn CGContextFillRect(env: &mut Environment, context: CGContextRef, rect: CGR
      cg_bitmap_context::fill_rect(env, context, rect, /* clear: */ false);
  }
- 
+
 +pub fn CGContextFillEllipseInRect(env: &mut Environment, context: CGContextRef, rect: CGRect) {
 +    cg_bitmap_context::fill_ellipse(env, context, rect);
 +}
@@ -869,7 +927,7 @@ index 897e267..208a460 100644
  pub fn CGContextClearRect(env: &mut Environment, context: CGContextRef, rect: CGRect) {
      cg_bitmap_context::fill_rect(env, context, rect, /* clear: */ true);
  }
- 
+
  fn CGContextClipToRect(env: &mut Environment, context: CGContextRef, rect: CGRect) {
 -    if rect.origin == CGPointZero
 -        && rect.size.height == CGBitmapContextGetHeight(env, context) as f32
@@ -887,7 +945,7 @@ index 897e267..208a460 100644
 +    let host_obj = env.objc.borrow_mut::<CGContextHostObject>(context);
 +    host_obj.clip_regions.push((rect, host_obj.transform));
  }
- 
+
  pub fn CGContextConcatCTM(
 @@ -276,6 +268,7 @@ fn CGContextSaveGState(env: &mut Environment, context: CGContextRef) {
          host_obj.font,
@@ -903,7 +961,7 @@ index 897e267..208a460 100644
      host_obj.blend_mode = state.4;
 +    host_obj.clip_regions = state.5;
  }
- 
+
  fn CGContextSetInterpolationQuality(
 @@ -440,6 +434,7 @@ pub const FUNCTIONS: FunctionExports = &[
      export_c_func!(CGContextSetRGBStrokeColor(_, _, _, _, _)),
@@ -920,7 +978,7 @@ index 0d29554..690ec06 100644
 @@ -270,6 +270,57 @@ fn CGRectContainsPoint(_env: &mut Environment, rect: CGRect, point: CGPoint) ->
          && rect.origin.y + rect.size.height > point.y
  }
- 
+
 +fn contains_rect(outer: CGRect, inner: CGRect) -> bool {
 +    // CGRectNull is the empty set: its union with any rectangle is that
 +    // rectangle, including when the rectangle itself is null.
@@ -1039,7 +1097,7 @@ index 18f809a..10a5132 100644
 +++ b/src/frameworks/foundation/ns_array.rs
 @@ -281,10 +281,13 @@ pub const CLASSES: ClassExports = objc_classes! {
  }
- 
+
  + (id)arrayWithObjects:(id)firstObj, ...args {
 -    retain(env, firstObj);
 -    let mut objects = vec![firstObj];
@@ -1057,7 +1115,7 @@ index 18f809a..10a5132 100644
 @@ -296,6 +299,22 @@ pub const CLASSES: ClassExports = objc_classes! {
      autorelease(env, array)
  }
- 
+
 +- (id)initWithObjects:(id)firstObj, ...args {
 +    if firstObj == nil {
 +        return this;
@@ -1096,12 +1154,12 @@ index fa7607d..938ea76 100644
 -    localization_tables: HashMap<id, id>, // NSString* to NSDictionary*
 +    localization_tables: HashMap<(id, id), id>, // (NSBundle*, NSString*) to NSDictionary*
  }
- 
+
  pub struct NSBundleHostObject {
 @@ -65,6 +66,17 @@ pub const CLASSES: ClassExports = objc_classes! {
- 
+
  @implementation NSBundle: NSObject
- 
+
 ++ (id)allocWithZone:(NSZonePtr)_zone {
 +    let host_object = NSBundleHostObject {
 +        bundle: None,
@@ -1119,7 +1177,7 @@ index fa7607d..938ea76 100644
 @@ -80,20 +92,47 @@ pub const CLASSES: ClassExports = objc_classes! {
      autorelease(env, preferredLocalizations)
  }
- 
+
 +- (id)initWithPath:(id)path {
 +    let path_string = if path == nil {
 +        String::new()
@@ -1165,7 +1223,7 @@ index fa7607d..938ea76 100644
 +    }
      env.objc.dealloc_object(this, &mut env.mem)
  }
- 
+
 @@ -221,6 +260,24 @@ pub const CLASSES: ClassExports = objc_classes! {
                 ofType:(id)extension { // NSString*
      msg![env; this pathForResource:name ofType:extension inDirectory:nil]
@@ -1306,7 +1364,7 @@ index cc40c2e..2e54ff4 100644
 @@ -22,6 +22,15 @@ pub(super) struct NSDataHostObject {
  }
  impl HostObject for NSDataHostObject {}
- 
+
 +fn replaced_bytes(original: &[u8], start: usize, removed: usize, inserted: &[u8]) -> Vec<u8> {
 +    assert!(start <= original.len() && removed <= original.len() - start);
 +    let mut result = Vec::with_capacity(original.len() - removed + inserted.len());
@@ -1317,12 +1375,12 @@ index cc40c2e..2e54ff4 100644
 +}
 +
  pub const CLASSES: ClassExports = objc_classes! {
- 
+
  (env, this, _cmd);
 @@ -340,6 +349,41 @@ pub const CLASSES: ClassExports = objc_classes! {
      log_dbg!("setLength bytes {:?}, new_bytes {:?}; length {}, new_len {}", bytes, new_bytes, length, new_length);
  }
- 
+
 +- (())replaceBytesInRange:(NSRange)range
 +                withBytes:(ConstVoidPtr)new_bytes
 +                   length:(NSUInteger)new_length {
@@ -1359,7 +1417,7 @@ index cc40c2e..2e54ff4 100644
 +}
 +
  @end
- 
+
  };
 @@ -350,3 +394,15 @@ pub fn to_rust_slice(env: &mut Environment, data: id) -> &[u8] {
      env.mem
@@ -1518,9 +1576,9 @@ index 7e49445..beff680 100644
 --- a/src/frameworks/foundation/ns_dictionary.rs
 +++ b/src/frameworks/foundation/ns_dictionary.rs
 @@ -472,6 +472,23 @@ pub const CLASSES: ClassExports = objc_classes! {
- 
+
  // TODO
- 
+
 +- (id)allValues {
 +    let keys: id = msg![env; this allKeys];
 +    let values: id = msg_class![env; NSMutableArray array];
@@ -1585,7 +1643,7 @@ index b5d1e58..bd2bf64 100644
 --- a/src/frameworks/foundation/ns_invocation.rs
 +++ b/src/frameworks/foundation/ns_invocation.rs
 @@ -7,6 +7,7 @@
- 
+
  use crate::abi::{extend_stack_for_args, write_next_arg, GuestArg};
  use crate::cpu::Cpu;
 +use crate::frameworks::core_graphics::CGRect;
@@ -1689,7 +1747,7 @@ index 6e160fa..df81a1d 100644
 --- a/src/frameworks/foundation/ns_object.rs
 +++ b/src/frameworks/foundation/ns_object.rs
 @@ -68,7 +68,12 @@ pub const CLASSES: ClassExports = objc_classes! {
- 
+
  + (())cancelPreviousPerformRequestsWithTarget:(id)target selector:(SEL)selector object:(id)arg {
      let run_loop: id = msg_class![env; NSRunLoop currentRunLoop];
 -    cancel_perform_requests(env, run_loop, target, selector, arg);
@@ -1700,12 +1758,12 @@ index 6e160fa..df81a1d 100644
 +    let run_loop: id = msg_class![env; NSRunLoop currentRunLoop];
 +    cancel_perform_requests(env, run_loop, target, None, None);
  }
- 
+
  + (bool)accessInstanceVariablesDirectly {
 @@ -148,10 +153,18 @@ pub const CLASSES: ClassExports = objc_classes! {
      this == other
  }
- 
+
 -// TODO: Instance description and debugDescription.
 -// This is not hard to add, but before adding a fallback implementation of it,
 -// we should make sure all the Foundation classes' overrides of it are there,
@@ -1723,7 +1781,7 @@ index 6e160fa..df81a1d 100644
 +}
 +
  // TODO: localized description methods also? (not sure if NSObject has them)
- 
+
  // Helper for NSCopying
 diff --git a/src/frameworks/foundation/ns_run_loop.rs b/src/frameworks/foundation/ns_run_loop.rs
 index f473e09..5646b99 100644
@@ -1732,7 +1790,7 @@ index f473e09..5646b99 100644
 @@ -245,33 +245,30 @@ pub(super) fn add_perform_request(
      semaphore
  }
- 
+
 -/// Cancels a selector that was previously requested by [add_perform_request].
 -/// The argument arg is compared via isEqual, [as documented by Apple]
 +/// Cancels selectors previously requested by [add_perform_request].
@@ -1774,12 +1832,12 @@ index f473e09..5646b99 100644
          if arg_equal {
              let ObjectSelectorSource {
 @@ -440,6 +437,7 @@ pub fn run_run_loop(
- 
+
          if is_main_run_loop {
              media_player::handle_players(env);
 +            uikit::ui_view::layout_pending_views(env);
          }
- 
+
          // Unfortunately, touchHLE has to poll for certain things repeatedly;
 diff --git a/src/frameworks/foundation/ns_string.rs b/src/frameworks/foundation/ns_string.rs
 index 1955f2b..2143687 100644
@@ -1796,7 +1854,7 @@ index 1955f2b..2143687 100644
 +        return nil;
 +    }
      let host_object = StringHostObject::decode(Cow::Borrowed(slice), encoding);
- 
+
      *env.objc.borrow_mut(this) = host_object;
 @@ -1597,8 +1600,11 @@ pub const CLASSES: ClassExports = objc_classes! {
  - (id)initWithBytes:(ConstPtr<u8>)bytes
@@ -1809,7 +1867,7 @@ index 1955f2b..2143687 100644
 +        return nil;
 +    }
      let host_object = StringHostObject::decode(Cow::Borrowed(slice), encoding);
- 
+
      *env.objc.borrow_mut(this) = host_object;
 diff --git a/src/frameworks/foundation/ns_url.rs b/src/frameworks/foundation/ns_url.rs
 index 9111ce3..f5de200 100644
@@ -1818,7 +1876,7 @@ index 9111ce3..f5de200 100644
 @@ -34,6 +34,71 @@ enum NSURLHostObject {
  }
  impl HostObject for NSURLHostObject {}
- 
+
 +/// Extract the authority's host without resolving or contacting the URL.
 +fn url_authority(url: &str) -> Option<&str> {
 +    let (scheme, rest) = url.split_once("://")?;
@@ -1885,12 +1943,12 @@ index 9111ce3..f5de200 100644
 +}
 +
  pub const CLASSES: ClassExports = objc_classes! {
- 
+
  (env, this, _cmd);
 @@ -160,6 +225,31 @@ pub const CLASSES: ClassExports = objc_classes! {
      this
  }
- 
+
 +- (id)host {
 +    let NSURLHostObject::OtherURL { ns_string } = *env.objc.borrow(this) else {
 +        return nil;
@@ -1984,7 +2042,7 @@ index f848ce9..8fb74bd 100644
 -    constant_exports: &[movie_player::CONSTANTS, music_player::CONSTANTS],
      function_exports: &[],
  };
- 
+
 diff --git a/src/frameworks/media_player/media_entity.rs b/src/frameworks/media_player/media_entity.rs
 index b07fd18..3d44712 100644
 --- a/src/frameworks/media_player/media_entity.rs
@@ -1992,10 +2050,10 @@ index b07fd18..3d44712 100644
 @@ -5,8 +5,21 @@
   */
  //! `MPMediaEntity`.
- 
+
 +use crate::dyld::{ConstantExports, HostConstant};
  use crate::objc::{objc_classes, ClassExports};
- 
+
 +pub const CONSTANTS: ConstantExports = &[
 +    (
 +        "_MPMediaItemPropertyArtist",
@@ -2009,7 +2067,7 @@ index b07fd18..3d44712 100644
 +];
 +
  pub const CLASSES: ClassExports = objc_classes! {
- 
+
  (env, this, _cmd);
 diff --git a/src/frameworks/media_player/media_picker_controller.rs b/src/frameworks/media_player/media_picker_controller.rs
 index 9faaa9b..a5f38f3 100644
@@ -2018,7 +2076,7 @@ index 9faaa9b..a5f38f3 100644
 @@ -5,14 +5,77 @@
   */
  //! `MPMediaPickerController`.
- 
+
 -use crate::objc::{objc_classes, ClassExports};
 +use crate::frameworks::uikit::ui_view_controller::UIViewControllerHostObject;
 +use crate::objc::{
@@ -2035,11 +2093,11 @@ index 9faaa9b..a5f38f3 100644
 +    prompt: id,
 +}
 +impl_HostObject_with_superclass!(MPMediaPickerControllerHostObject);
- 
+
  pub const CLASSES: ClassExports = objc_classes! {
- 
+
  (env, this, _cmd);
- 
+
  @implementation MPMediaPickerController: UIViewController
 -// TODO
 +
@@ -2093,7 +2151,7 @@ index 9faaa9b..a5f38f3 100644
 +}
 +
  @end
- 
+
  };
 diff --git a/src/frameworks/media_player/media_property_predicate.rs b/src/frameworks/media_player/media_property_predicate.rs
 new file mode 100644
@@ -2175,7 +2233,7 @@ index a1e84ff..ca0e155 100644
 @@ -5,7 +5,17 @@
   */
  //! `MPMediaQuery`.
- 
+
 -use crate::objc::{id, nil, objc_classes, ClassExports};
 +use crate::frameworks::foundation::ns_array;
 +use crate::objc::{
@@ -2188,13 +2246,13 @@ index a1e84ff..ca0e155 100644
 +    predicates: Vec<id>,
 +}
 +impl HostObject for MPMediaQueryHostObject {}
- 
+
  pub const CLASSES: ClassExports = objc_classes! {
- 
+
 @@ -13,14 +23,67 @@ pub const CLASSES: ClassExports = objc_classes! {
- 
+
  @implementation MPMediaQuery: NSObject
- 
+
 ++ (id)allocWithZone:(NSZonePtr)_zone {
 +    env.objc
 +        .alloc_object(this, Box::new(MPMediaQueryHostObject::default()), &mut env.mem)
@@ -2206,7 +2264,7 @@ index a1e84ff..ca0e155 100644
 +    let query: id = msg![env; this new];
 +    autorelease(env, query)
  }
- 
+
  + (id)songsQuery {
 -    log!("TODO: [MPMediaQuery songsQuery] (not implemented yet)");
 -    nil
@@ -2261,7 +2319,7 @@ index a1e84ff..ca0e155 100644
 +    }
 +    env.objc.dealloc_object(this, &mut env.mem);
  }
- 
+
  @end
 diff --git a/src/frameworks/media_player/movie_player.rs b/src/frameworks/media_player/movie_player.rs
 index 63a782f..584d2e7 100644
@@ -2282,7 +2340,7 @@ index 63a782f..584d2e7 100644
 +use std::process::{Child, Command, Stdio};
 +use std::sync::{mpsc, Arc};
  use std::time::{Duration, Instant};
- 
+
 +// All three movies in this game's iPhone bundle use 480x320 at 30 fps.
 +const VIDEO_SIZE: (u32, u32) = (480, 320);
 +const FRAME_BYTES: usize = VIDEO_SIZE.0 as usize * VIDEO_SIZE.1 as usize * 4;
@@ -2314,7 +2372,7 @@ index 63a782f..584d2e7 100644
 @@ -32,11 +58,108 @@ impl State {
      }
  }
- 
+
 +impl Drop for State {
 +    fn drop(&mut self) {
 +        if let Some(mut playback) = self.playback.take() {
@@ -2413,11 +2471,11 @@ index 63a782f..584d2e7 100644
 +
  type MPMovieScalingMode = NSInteger;
  type MPMovieControlStyle = NSInteger;
- 
+
  type MPMoviePlaybackState = NSInteger;
  const MPMoviePlaybackStateStopped: MPMoviePlaybackState = 0;
 +const MPMoviePlaybackStatePlaying: MPMoviePlaybackState = 1;
- 
+
  // Values might not be correct, but as these are linked symbol constants, it
  // shouldn't matter.
 @@ -47,6 +170,10 @@ pub const MPMoviePlayerContentPreloadDidFinishNotification: &str =
@@ -2453,7 +2511,7 @@ index 63a782f..584d2e7 100644
 +    fullscreen: bool,
  }
  impl HostObject for MPMoviePlayerControllerHostObject {}
- 
+
 @@ -88,6 +224,7 @@ pub const CLASSES: ClassExports = objc_classes! {
  + (id)allocWithZone:(NSZonePtr)_zone {
      let host_object = Box::new(MPMoviePlayerControllerHostObject {
@@ -2493,7 +2551,7 @@ index 63a782f..584d2e7 100644
      todo_objc_setter!(this, initial_time);
 @@ -150,7 +305,17 @@ pub const CLASSES: ClassExports = objc_classes! {
  }
- 
+
  - (MPMoviePlaybackState)playbackState {
 -    MPMoviePlaybackStateStopped // TODO
 +    let state = State::get(env);
@@ -2508,10 +2566,10 @@ index 63a782f..584d2e7 100644
 +        MPMoviePlaybackStateStopped
 +    }
  }
- 
+
  // Apparently an undocumented, private API, but Spore Origins uses it.
 @@ -167,7 +332,11 @@ pub const CLASSES: ClassExports = objc_classes! {
- 
+
  // MPMediaPlayback implementation
  - (())play {
 -    log!("TODO: [(MPMoviePlayerController*){:?} play]", this);
@@ -2526,7 +2584,7 @@ index 63a782f..584d2e7 100644
 @@ -176,7 +345,15 @@ pub const CLASSES: ClassExports = objc_classes! {
      retain(env, this);
      env.framework_state.media_player.movie_player.active_player = Some(this);
- 
+
 -    // Act as if playback immediately completed after 1 second
 +    if let Some(playback) = start_video(env, this) {
 +        if let Some(window) = env.window.as_mut() {
@@ -2541,7 +2599,7 @@ index 63a782f..584d2e7 100644
      let notif = (MPMoviePlayerPlaybackDidFinishNotification, this, Instant::now().checked_add(Duration::from_millis(1000)).unwrap());
      for (name, obj, _) in &mut State::get(env).pending_notifications {
 @@ -195,6 +372,16 @@ pub const CLASSES: ClassExports = objc_classes! {
- 
+
  - (())stop {
      log!("TODO: [(MPMoviePlayerController*){:?} stop]", this);
 +    if let Some(mut playback) = State::get(env).playback.take() {
@@ -2628,8 +2686,202 @@ index 63a782f..584d2e7 100644
      let mut notifs_to_run = Vec::new();
      let pending_notifs = &mut State::get(env).pending_notifications;
      let mut i = 0;
+diff --git a/src/frameworks/opengles.rs b/src/frameworks/opengles.rs
+index b00645c..b25d88d 100644
+--- a/src/frameworks/opengles.rs
++++ b/src/frameworks/opengles.rs
+@@ -57,3 +57,189 @@ fn get_thread_context<'objc>(
+     let gles_ctx = host_obj.gles_ctx.as_deref_mut().unwrap();
+     gles_ctx
+ }
++
++/// Keep logical allocation dimensions for live render-scale changes. Names and
++/// attachments are preserved; shared EAGL contexts share this registry.
++fn record_renderbuffer(
++    env: &mut crate::Environment,
++    name: u32,
++    format: GLenum,
++    width: i32,
++    height: i32,
++) {
++    if !env.options.display_service {
++        return;
++    }
++    if let Some(context) = *env
++        .framework_state
++        .opengles
++        .current_ctx_for_thread(env.current_thread)
++    {
++        env.objc
++            .borrow_mut::<eagl::EAGLContextHostObject>(context)
++            .renderbuffers
++            .borrow_mut()
++            .insert(name, (format, width, height));
++    }
++}
++
++fn scaled_rectangle(rect: [i32; 4], old: u32, new: u32) -> [i32; 4] {
++    rect.map(|value| (i64::from(value) * i64::from(new) / i64::from(old)) as i32)
++}
++
++pub(crate) fn resize_renderbuffers(
++    env: &mut crate::Environment,
++    old: u32,
++    new: u32,
++) -> Result<(), String> {
++    if old == new {
++        return Ok(());
++    }
++    use crate::gles::{gles11_raw as gl, GLES};
++    struct Plan {
++        context: crate::objc::id,
++        buffers: Vec<(u32, (GLenum, i32, i32))>,
++        viewport: [i32; 4],
++        scissor: [i32; 4],
++    }
++    fn resize(gles: &mut dyn GLES, plan: &Plan, old: u32, scale: u32) -> Result<(), String> {
++        let mut binding = 0;
++        unsafe {
++            gles.GetIntegerv(gl::RENDERBUFFER_BINDING_OES, &mut binding);
++        }
++        let mut result = Ok(());
++        for &(name, (format, width, height)) in &plan.buffers {
++            let (width, height) = (width * scale as i32, height * scale as i32);
++            unsafe {
++                gles.BindRenderbufferOES(gl::RENDERBUFFER_OES, name);
++                gles.RenderbufferStorageOES(gl::RENDERBUFFER_OES, format, width, height);
++                let (mut actual_width, mut actual_height) = (0, 0);
++                gles.GetRenderbufferParameterivOES(
++                    gl::RENDERBUFFER_OES,
++                    gl::RENDERBUFFER_WIDTH_OES,
++                    &mut actual_width,
++                );
++                gles.GetRenderbufferParameterivOES(
++                    gl::RENDERBUFFER_OES,
++                    gl::RENDERBUFFER_HEIGHT_OES,
++                    &mut actual_height,
++                );
++                if (actual_width, actual_height) != (width, height) {
++                    result = Err(format!(
++                        "Could not resize renderbuffer {} to {} x {}",
++                        name, width, height
++                    ));
++                    break;
++                }
++            }
++        }
++        unsafe {
++            gles.BindRenderbufferOES(gl::RENDERBUFFER_OES, binding as u32);
++            let [x, y, w, h] = scaled_rectangle(plan.viewport, old, scale);
++            gles.Viewport(x, y, w, h);
++            let [x, y, w, h] = scaled_rectangle(plan.scissor, old, scale);
++            gles.Scissor(x, y, w, h);
++        }
++        result
++    }
++    let contexts = env
++        .objc
++        .all_classes()
++        .find(|(name, _)| name.as_str() == "EAGLContext")
++        .map(|(_, &class)| env.objc.instances_of_class(class, &env.mem))
++        .unwrap_or_default();
++    let mut plans = Vec::new();
++    let mut groups = std::collections::HashSet::new();
++    for context in contexts {
++        let host = env.objc.borrow_mut::<eagl::EAGLContextHostObject>(context);
++        let Some(ctx) = host.gles_ctx.as_mut() else {
++            continue;
++        };
++        let mut gles = ctx.make_current(env.window.as_mut().unwrap());
++        let mut plan = Plan {
++            context,
++            buffers: Vec::new(),
++            viewport: [0; 4],
++            scissor: [0; 4],
++        };
++        unsafe {
++            gles.GetIntegerv(gl::VIEWPORT, plan.viewport.as_mut_ptr());
++            gles.GetIntegerv(gl::SCISSOR_BOX, plan.scissor.as_mut_ptr());
++        }
++        if groups.insert(std::rc::Rc::as_ptr(&host.renderbuffers) as usize) {
++            plan.buffers = host
++                .renderbuffers
++                .borrow()
++                .iter()
++                .map(|(&name, &allocation)| (name, allocation))
++                .collect();
++            let mut limit = 0;
++            unsafe {
++                gles.GetIntegerv(gl::MAX_RENDERBUFFER_SIZE_OES, &mut limit);
++            }
++            for &(_, (_, width, height)) in &plan.buffers {
++                if width < 0
++                    || height < 0
++                    || i64::from(width) * i64::from(new) > i64::from(limit)
++                    || i64::from(height) * i64::from(new) > i64::from(limit)
++                {
++                    return Err(format!(
++                        "Render scale exceeds the GPU renderbuffer limit ({})",
++                        limit
++                    ));
++                }
++            }
++        }
++        plans.push(plan);
++    }
++    for (index, plan) in plans.iter().enumerate() {
++        let result = {
++            let host = env
++                .objc
++                .borrow_mut::<eagl::EAGLContextHostObject>(plan.context);
++            let mut gles = host
++                .gles_ctx
++                .as_mut()
++                .unwrap()
++                .make_current(env.window.as_mut().unwrap());
++            resize(gles.as_mut(), plan, old, new)
++        };
++        if let Err(error) = result {
++            for rollback in &plans[..=index] {
++                let host = env
++                    .objc
++                    .borrow_mut::<eagl::EAGLContextHostObject>(rollback.context);
++                let mut gles = host
++                    .gles_ctx
++                    .as_mut()
++                    .unwrap()
++                    .make_current(env.window.as_mut().unwrap());
++                if let Err(rollback_error) = resize(gles.as_mut(), rollback, old, old) {
++                    log!("Renderbuffer rollback failed: {}", rollback_error);
++                }
++            }
++            return Err(error);
++        }
++    }
++    log!(
++        "Resized guest renderbuffers live: {}x -> {}x ({} contexts)",
++        old,
++        new,
++        plans.len()
++    );
++    Ok(())
++}
++
++#[cfg(test)]
++#[test]
++fn live_render_scale_restores_viewport_and_scissor_coordinates() {
++    assert_eq!(scaled_rectangle([0, 0, 480, 320], 1, 4), [0, 0, 1920, 1280]);
++    assert_eq!(
++        scaled_rectangle([60, 110, 750, 490], 2, 3),
++        [90, 165, 1125, 735]
++    );
++    assert_eq!(
++        scaled_rectangle([90, 165, 1125, 735], 3, 2),
++        [60, 110, 750, 490]
++    );
++}
 diff --git a/src/frameworks/opengles/eagl.rs b/src/frameworks/opengles/eagl.rs
-index 32a0b5c..72d764f 100644
+index 32a0b5c..0f967c5 100644
 --- a/src/frameworks/opengles/eagl.rs
 +++ b/src/frameworks/opengles/eagl.rs
 @@ -9,6 +9,7 @@ use crate::dyld::{ConstantExports, HostConstant};
@@ -2640,24 +2892,64 @@ index 32a0b5c..72d764f 100644
  use crate::frameworks::core_graphics::{CGRect, CGSize};
  use crate::frameworks::foundation::ns_string::get_static_str;
  use crate::frameworks::foundation::NSUInteger;
-@@ -224,6 +225,7 @@ pub const CLASSES: ClassExports = objc_classes! {
+@@ -66,6 +67,7 @@ pub(super) struct EAGLContextHostObject {
+     renderbuffer_drawable_bindings: Rc<RefCell<HashMap<GLuint, id>>>,
+     fps_counter: Option<FpsCounter>,
+     next_frame_due: Option<Instant>,
++    pub renderbuffers: Rc<RefCell<HashMap<GLuint, (GLenum, i32, i32)>>>,
+     pub mapped_buffers: HashMap<GLuint, (MutPtr<GLvoid>, *mut GLvoid)>,
+ }
+ impl HostObject for EAGLContextHostObject {}
+@@ -83,6 +85,7 @@ pub const CLASSES: ClassExports = objc_classes! {
+         fps_counter: None,
+         next_frame_due: None,
+         mapped_buffers: HashMap::new(),
++        renderbuffers: Rc::new(RefCell::new(HashMap::new())),
+     });
+     env.objc.alloc_object(this, host_object, &mut env.mem)
+ }
+@@ -147,6 +150,7 @@ pub const CLASSES: ClassExports = objc_classes! {
+
+     env.window.as_mut().unwrap().set_share_with_current_context(false);
+
++    env.objc.borrow_mut::<EAGLContextHostObject>(this).renderbuffers = env.objc.borrow::<EAGLContextHostObject>(group).renderbuffers.clone();
+     env.objc.borrow_mut::<EAGLContextHostObject>(this).renderbuffer_drawable_bindings = env.objc.borrow::<EAGLContextHostObject>(group).renderbuffer_drawable_bindings.clone();
+     this
+ }
+@@ -224,6 +228,7 @@ pub const CLASSES: ClassExports = objc_classes! {
      }
      let internalformat = gles11::RGBA8_OES;
- 
+
 +    fit_fullscreen_layers_to_landscape(env, drawable);
      let (width, height) = {
          let bounds: CGRect = msg![env; drawable bounds];
          let CGSize { width, height } = bounds.size;
-@@ -302,6 +304,8 @@ pub const CLASSES: ClassExports = objc_classes! {
+@@ -248,6 +253,7 @@ pub const CLASSES: ClassExports = objc_classes! {
+         }
+     };
+
++    super::record_renderbuffer(env, renderbuffer, internalformat, (width / env.options.scale_hack.get()) as i32, (height / env.options.scale_hack.get()) as i32);
+     retain(env, drawable);
+     let host_obj = env.objc.borrow_mut::<EAGLContextHostObject>(this);
+     let maybe_old_drawable = host_obj.renderbuffer_drawable_bindings.borrow_mut().insert(
+@@ -262,6 +268,7 @@ pub const CLASSES: ClassExports = objc_classes! {
+ }
+
+ - (bool)presentRenderbuffer:(NSUInteger)target {
++    crate::frameworks::uikit::rebellion_scroll::present(env);
+     assert!(target == gles11::RENDERBUFFER_OES);
+
+     // The presented frame should be displayed ASAP, but the next one must be
+@@ -302,6 +309,8 @@ pub const CLASSES: ClassExports = objc_classes! {
          return false;
      };
- 
+
 +    fit_fullscreen_layers_to_landscape(env, drawable);
 +
      // We're presenting to the opaque CAEAGLLayer that covers the screen.
      // We can use the fast path where we skip composition and present directly.
      if drawable == fullscreen_layer {
-@@ -549,7 +553,11 @@ unsafe fn read_renderbuffer(gles: &mut dyn GLES, mut pixel_buffer: Vec<u8>) -> (
+@@ -549,7 +558,11 @@ unsafe fn read_renderbuffer(gles: &mut dyn GLES, mut pixel_buffer: Vec<u8>) -> (
  unsafe fn present_renderbuffer(env: &mut Environment) {
      // Save these for when we need to draw the frame
      let viewport = env.window.as_mut().unwrap().viewport();
@@ -2668,19 +2960,19 @@ index 32a0b5c..72d764f 100644
 +        env.window.as_mut().unwrap().rotation_matrix()
 +    };
      let virtual_cursor_visible_at = env.window.as_mut().unwrap().virtual_cursor_visible_at();
- 
+
      let gles_ctx = super::get_thread_context(
-@@ -749,7 +757,7 @@ unsafe fn present_renderbuffer(env: &mut Environment) {
- 
+@@ -749,7 +762,7 @@ unsafe fn present_renderbuffer(env: &mut Environment) {
+
      // SDL2's documentation warns 0 should be bound to the draw framebuffer
      // when swapping the window, so this is the perfect moment.
 -    env.window.as_ref().unwrap().swap_window();
 +    env.window.as_mut().unwrap().swap_window();
- 
+
      let mut gles_boxed = gles_ctx.make_current(env.window.as_mut().unwrap());
      let gles = gles_boxed.as_mut();
 diff --git a/src/frameworks/opengles/gles_guest.rs b/src/frameworks/opengles/gles_guest.rs
-index 9c86ac4..34d5278 100644
+index 9c86ac4..6420703 100644
 --- a/src/frameworks/opengles/gles_guest.rs
 +++ b/src/frameworks/opengles/gles_guest.rs
 @@ -824,6 +824,26 @@ fn glPopMatrix(env: &mut Environment) {
@@ -2733,7 +3025,74 @@ index 9c86ac4..34d5278 100644
      with_ctx_and_mem(env, |gles, _mem| {
          unsafe { gles.Orthof(left, right, bottom, top, near, far) };
      });
-@@ -1656,3 +1692,32 @@ fn _get_buffer_size(env: &mut Environment, target: GLenum) -> GLint {
+@@ -1269,9 +1305,40 @@ fn glRenderbufferStorageOES(
+     // apply scale hack: give the app a larger framebuffer than it asked for
+     let factor = env.options.scale_hack.get() as GLsizei;
+     let (width, height) = (width * factor, height * factor);
+-    with_ctx_and_mem(env, |gles, _mem| unsafe {
+-        gles.RenderbufferStorageOES(target, internalformat, width, height)
+-    })
++    let track = env.options.display_service;
++    let renderbuffer = with_ctx_and_mem(env, |gles, _mem| unsafe {
++        gles.RenderbufferStorageOES(target, internalformat, width, height);
++        if !track {
++            return 0;
++        }
++        let mut name = 0;
++        let (mut actual_width, mut actual_height) = (0, 0);
++        gles.GetIntegerv(gles11::RENDERBUFFER_BINDING_OES, &mut name);
++        gles.GetRenderbufferParameterivOES(
++            target,
++            gles11::RENDERBUFFER_WIDTH_OES,
++            &mut actual_width,
++        );
++        gles.GetRenderbufferParameterivOES(
++            target,
++            gles11::RENDERBUFFER_HEIGHT_OES,
++            &mut actual_height,
++        );
++        if actual_width == width && actual_height == height {
++            name as u32
++        } else {
++            0
++        }
++    });
++    if renderbuffer != 0 {
++        super::record_renderbuffer(
++            env,
++            renderbuffer,
++            internalformat,
++            width / factor,
++            height / factor,
++        );
++    }
+ }
+ fn glFramebufferRenderbufferOES(
+     env: &mut Environment,
+@@ -1338,6 +1405,22 @@ fn glDeleteFramebuffersOES(env: &mut Environment, n: GLsizei, framebuffers: Cons
+     })
+ }
+ fn glDeleteRenderbuffersOES(env: &mut Environment, n: GLsizei, renderbuffers: ConstPtr<GLuint>) {
++    if env.options.display_service {
++        let count: u32 = n.try_into().unwrap();
++        let names: Vec<GLuint> = (0..count)
++            .map(|i| env.mem.read(renderbuffers + i))
++            .collect();
++        if let Some(context) = *env
++            .framework_state
++            .opengles
++            .current_ctx_for_thread(env.current_thread)
++        {
++            let host = env.objc.borrow_mut::<EAGLContextHostObject>(context);
++            for name in names {
++                host.renderbuffers.borrow_mut().remove(&name);
++            }
++        }
++    }
+     with_ctx_and_mem(env, |gles, mem| {
+         let n_usize: GuestUSize = n.try_into().unwrap();
+         let renderbuffers = mem.ptr_at(renderbuffers, n_usize);
+@@ -1656,3 +1739,32 @@ fn _get_buffer_size(env: &mut Environment, target: GLenum) -> GLint {
          buffer_size
      })
  }
@@ -2767,14 +3126,17 @@ index 9c86ac4..34d5278 100644
 +    }
 +}
 diff --git a/src/frameworks/uikit.rs b/src/frameworks/uikit.rs
-index c8e6773..e708e50 100644
+index c8e6773..e9f766f 100644
 --- a/src/frameworks/uikit.rs
 +++ b/src/frameworks/uikit.rs
-@@ -12,9 +12,11 @@
+@@ -12,9 +12,14 @@
  use crate::{msg, Environment};
  use std::time::Instant;
- 
+
 +pub(crate) mod rebellion_progress;
++pub(crate) mod rebellion_scroll;
++#[cfg(feature = "rebellion-test-tools")]
++mod rebellion_test_tools;
  pub mod ui_accelerometer;
  pub mod ui_activity_indicator_view;
  pub mod ui_application;
@@ -2782,7 +3144,7 @@ index c8e6773..e708e50 100644
  pub mod ui_color;
  pub mod ui_device;
  pub mod ui_event;
-@@ -24,6 +26,7 @@ pub mod ui_graphics;
+@@ -24,6 +29,7 @@ pub mod ui_graphics;
  pub mod ui_image;
  pub mod ui_image_picker_controller;
  pub mod ui_local_notification;
@@ -2790,7 +3152,7 @@ index c8e6773..e708e50 100644
  pub mod ui_nib;
  pub mod ui_pasteboard;
  pub mod ui_responder;
-@@ -39,6 +42,7 @@ pub const DYLIB: crate::dyld::HostDylib = crate::dyld::HostDylib {
+@@ -39,6 +45,7 @@ pub const DYLIB: crate::dyld::HostDylib = crate::dyld::HostDylib {
          ui_accelerometer::CLASSES,
          ui_activity_indicator_view::CLASSES,
          ui_application::CLASSES,
@@ -2798,7 +3160,7 @@ index c8e6773..e708e50 100644
          ui_color::CLASSES,
          ui_device::CLASSES,
          ui_event::CLASSES,
-@@ -47,6 +51,7 @@ pub const DYLIB: crate::dyld::HostDylib = crate::dyld::HostDylib {
+@@ -47,6 +54,7 @@ pub const DYLIB: crate::dyld::HostDylib = crate::dyld::HostDylib {
          ui_image_picker_controller::CLASSES,
          ui_local_notification::CLASSES,
          ui_nib::CLASSES,
@@ -2806,7 +3168,7 @@ index c8e6773..e708e50 100644
          ui_pasteboard::CLASSES,
          ui_responder::CLASSES,
          ui_screen::CLASSES,
-@@ -61,6 +66,7 @@ pub const DYLIB: crate::dyld::HostDylib = crate::dyld::HostDylib {
+@@ -61,6 +69,7 @@ pub const DYLIB: crate::dyld::HostDylib = crate::dyld::HostDylib {
          ui_view::ui_control::ui_switch::CLASSES,
          ui_view::ui_image_view::CLASSES,
          ui_view::ui_label::CLASSES,
@@ -2814,7 +3176,7 @@ index c8e6773..e708e50 100644
          ui_view::ui_page_control::CLASSES,
          ui_view::ui_picker_view::CLASSES,
          ui_view::ui_scroll_view::CLASSES,
-@@ -69,6 +75,7 @@ pub const DYLIB: crate::dyld::HostDylib = crate::dyld::HostDylib {
+@@ -69,6 +78,7 @@ pub const DYLIB: crate::dyld::HostDylib = crate::dyld::HostDylib {
          ui_view::ui_window::CLASSES,
          ui_view_controller::CLASSES,
          ui_view_controller::ui_navigation_controller::CLASSES,
@@ -2822,27 +3184,41 @@ index c8e6773..e708e50 100644
      ],
      constant_exports: &[
          ui_application::CONSTANTS,
-@@ -85,6 +92,7 @@ pub const DYLIB: crate::dyld::HostDylib = crate::dyld::HostDylib {
- 
+@@ -85,6 +95,10 @@ pub const DYLIB: crate::dyld::HostDylib = crate::dyld::HostDylib {
+
  #[derive(Default)]
  pub struct State {
-+    rebellion_posters: Option<(u32, Vec<i32>)>,
++    rebellion_posters: Option<rebellion_progress::PosterProgress>,
++    rebellion_scroll: rebellion_scroll::State,
++    #[cfg(feature = "rebellion-test-tools")]
++    rebellion_test_tools: rebellion_test_tools::State,
      ui_accelerometer: ui_accelerometer::State,
      ui_application: ui_application::State,
      ui_color: ui_color::State,
-@@ -116,6 +124,8 @@ pub fn handle_events(env: &mut Environment) -> Option<Instant> {
+@@ -116,6 +130,19 @@ pub fn handle_events(env: &mut Environment) -> Option<Instant> {
              Event::TouchesDown(..) | Event::TouchesMove(..) | Event::TouchesUp(..) => {
                  ui_touch::handle_event(env, event)
              }
++            Event::ApplyDisplaySettings(settings) => crate::display_settings::apply(env, settings),
 +            Event::ActivateDoor => activate_8bit_rebellion_door(env),
 +            Event::ToggleGameMenu => toggle_8bit_rebellion_menu(env),
++            Event::Scroll { cursor, delta } => rebellion_scroll::scroll(
++                env,
++                crate::frameworks::core_graphics::CGPoint {
++                    x: cursor.0,
++                    y: cursor.1,
++                },
++                delta,
++            ),
++            #[cfg(feature = "rebellion-test-tools")]
++            Event::TestCheat(action) => rebellion_test_tools::apply(env, action),
              Event::AppWillResignActive => {
                  // Getting this event means touchHLE is becoming inactive, e.g.
                  // due to switching apps. The obvious way to handle this would
-@@ -169,5 +179,212 @@ pub fn handle_events(env: &mut Environment) -> Option<Instant> {
+@@ -169,5 +196,212 @@ pub fn handle_events(env: &mut Environment) -> Option<Instant> {
          }
      }
- 
+
 +    sync_8bit_rebellion_walk_direction(env);
 +    rebellion_progress::sync_posters(env);
      ui_accelerometer::handle_accelerometer(env)
@@ -3054,10 +3430,10 @@ index c8e6773..e708e50 100644
 +}
 diff --git a/src/frameworks/uikit/rebellion_progress.rs b/src/frameworks/uikit/rebellion_progress.rs
 new file mode 100644
-index 0000000..4f3d1d7
+index 0000000..1f01e1c
 --- /dev/null
 +++ b/src/frameworks/uikit/rebellion_progress.rs
-@@ -0,0 +1,248 @@
+@@ -0,0 +1,312 @@
 +// This game keeps its defaced-poster IDs only in a C++ vector. Its SQLite
 +// mission_state is a quest stage, and mission_data is not populated for them.
 +// Preserve that vector in the application's own Documents directory so both
@@ -3067,9 +3443,43 @@ index 0000000..4f3d1d7
 +use std::io::Cursor;
 +
 +const MAGIC: &[u8; 4] = b"8BP1";
-+const MAX_POSTERS: usize = 20;
++const MAX_POSTERS: usize = 24;
 +
-+fn write_atomically(fs: &mut crate::fs::Fs, path: &crate::fs::GuestPath, bytes: &[u8]) -> bool {
++/// In-memory progress can be newer than the file after a failed write.
++/// Retain it across mission object replacement until persistence succeeds.
++#[derive(Clone)]
++pub(super) struct PosterProgress {
++    pub mission: u32,
++    pub ids: Vec<i32>,
++    pending_write: bool,
++}
++impl PosterProgress {
++    pub fn saved(mission: u32, ids: Vec<i32>) -> Self {
++        Self {
++            mission,
++            ids,
++            pending_write: false,
++        }
++    }
++
++    fn persist_with(&mut self, write: impl FnOnce(&[i32]) -> bool) -> bool {
++        if !self.pending_write {
++            return true;
++        }
++        if write(&self.ids) {
++            self.pending_write = false;
++            true
++        } else {
++            false
++        }
++    }
++}
++
++pub(super) fn write_atomically(
++    fs: &mut crate::fs::Fs,
++    path: &crate::fs::GuestPath,
++    bytes: &[u8],
++) -> bool {
 +    let temporary_name = format!("{}.tmp", path.as_str());
 +    let temporary = crate::fs::GuestPath::new(&temporary_name);
 +    fs.write(temporary, bytes).is_ok() && fs.rename(temporary, path).is_ok()
@@ -3134,7 +3544,7 @@ index 0000000..4f3d1d7
 +    Some(ids)
 +}
 +
-+fn encode(ids: &[i32]) -> Vec<u8> {
++pub(super) fn encode(ids: &[i32]) -> Vec<u8> {
 +    let mut bytes = Vec::with_capacity(5 + 4 * ids.len());
 +    bytes.extend_from_slice(MAGIC);
 +    bytes.push(ids.len() as u8);
@@ -3157,7 +3567,7 @@ index 0000000..4f3d1d7
 +        .collect()
 +}
 +
-+fn poster_ids(env: &Environment, mission: crate::objc::id) -> Option<Vec<i32>> {
++pub(super) fn poster_ids(env: &Environment, mission: crate::objc::id) -> Option<Vec<i32>> {
 +    let ivar = env
 +        .objc
 +        .object_lookup_ivar(&env.mem, mission, &"defacedPosterList".to_owned())?;
@@ -3209,8 +3619,7 @@ index 0000000..4f3d1d7
 +    };
 +    let instances = env.objc.instances_of_class(class, &env.mem);
 +    let [mission] = instances.as_slice() else {
-+        env.framework_state.uikit.rebellion_posters = None;
-+        return;
++        return; // Keep any unsaved IDs while the mission is absent.
 +    };
 +    let mission = *mission;
 +    let Some(ids) = poster_ids(env, mission) else {
@@ -3220,27 +3629,22 @@ index 0000000..4f3d1d7
 +        .fs
 +        .home_directory()
 +        .join("Documents/8beet-poster-progress-v1");
-+    let first_seen = env
-+        .framework_state
-+        .uikit
-+        .rebellion_posters
-+        .as_ref()
-+        .map(|(ptr, _)| *ptr)
-+        != Some(mission.to_bits());
++    let cached = env.framework_state.uikit.rebellion_posters.as_ref();
++    let first_seen = cached.map(|progress| progress.mission) != Some(mission.to_bits());
++    let was_pending = cached.is_some_and(|progress| progress.pending_write);
 +    let mut saved = if first_seen {
-+        env.fs
++        let mut saved = env
++            .fs
 +            .read(&path)
 +            .ok()
 +            .and_then(|bytes| decode(&bytes))
-+            .unwrap_or_default()
++            .unwrap_or_default();
++        if let Some(progress) = cached.filter(|progress| progress.pending_write) {
++            merge_poster_ids(&mut saved, &progress.ids);
++        }
++        saved
 +    } else {
-+        env.framework_state
-+            .uikit
-+            .rebellion_posters
-+            .as_ref()
-+            .unwrap()
-+            .1
-+            .clone()
++        cached.unwrap().ids.clone()
 +    };
 +    let original_count = saved.len();
 +    let missing = merge_poster_ids(&mut saved, &ids);
@@ -3260,12 +3664,19 @@ index 0000000..4f3d1d7
 +    // A new mission object may reuse the same guest pointer. Its empty vector
 +    // is temporary, not a request to erase progress. Poster collection only
 +    // grows within this quest; save the union, never a smaller list.
-+    if saved.len() > original_count || (first_seen && !saved.is_empty() && !env.fs.exists(&path)) {
-+        if write_atomically(&mut env.fs, &path, &encode(&saved)) {
-+            log!("Saved {} 8-Bit Rebellion posters", saved.len());
++    let pending_write = was_pending
++        || saved.len() > original_count
++        || (first_seen && !saved.is_empty() && !env.fs.exists(&path));
++    let mut progress = PosterProgress::saved(mission.to_bits(), saved);
++    progress.pending_write = pending_write;
++    if progress.pending_write {
++        if progress.persist_with(|ids| write_atomically(&mut env.fs, &path, &encode(ids))) {
++            log!("Saved {} 8-Bit Rebellion posters", progress.ids.len());
++        } else if !was_pending {
++            log!("Could not save 8-Bit Rebellion posters; retaining progress for retry");
 +        }
 +    }
-+    env.framework_state.uikit.rebellion_posters = Some((mission.to_bits(), saved));
++    env.framework_state.uikit.rebellion_posters = Some(progress);
 +}
 +
 +#[cfg(test)]
@@ -3281,12 +3692,41 @@ index 0000000..4f3d1d7
 +    }
 +
 +    #[test]
++    fn all_twenty_four_mission_one_posters_can_be_saved() {
++        let ids: Vec<i32> = (0..24).collect();
++        assert_eq!(decode(&encode(&ids)), Some(ids));
++        assert_eq!(decode(&encode(&(0..25).collect::<Vec<_>>())), None);
++    }
++
++    #[test]
 +    fn an_empty_new_mission_does_not_erase_collected_posters() {
 +        let mut saved = vec![3, 8];
 +        assert_eq!(merge_poster_ids(&mut saved, &[]), vec![3, 8]);
 +        assert_eq!(saved, vec![3, 8]);
 +        assert_eq!(merge_poster_ids(&mut saved, &[3, 8, 12]), Vec::<i32>::new());
 +        assert_eq!(saved, vec![3, 8, 12]);
++    }
++
++    #[test]
++    fn failed_poster_write_is_retried_without_new_collection() {
++        let mut progress = super::PosterProgress {
++            mission: 123,
++            ids: vec![3, 8, 12],
++            pending_write: true,
++        };
++        assert!(!progress.persist_with(|ids| {
++            assert_eq!(ids, &[3, 8, 12]);
++            false
++        }));
++        assert!(progress.pending_write);
++        // The next sync sees the same IDs, but must still write them.
++        assert!(merge_poster_ids(&mut progress.ids, &[3, 8, 12]).is_empty());
++        assert!(progress.persist_with(|ids| {
++            assert_eq!(super::decode(&super::encode(ids)), Some(vec![3, 8, 12]));
++            true
++        }));
++        assert!(!progress.pending_write);
++        assert!(progress.persist_with(|_| panic!("Clean progress must not be rewritten")));
 +    }
 +
 +    #[test]
@@ -3313,7 +3753,7 @@ index 7384f20..d9d899a 100644
 @@ -5,10 +5,11 @@
   */
  //! `UIActivityIndicatorView`.
- 
+
 +use crate::frameworks::core_graphics::CGRect;
  use crate::frameworks::foundation::NSInteger;
  use crate::objc::{
@@ -3322,7 +3762,7 @@ index 7384f20..d9d899a 100644
 +    id, impl_HostObject_with_superclass, msg, msg_super, objc_classes, todo_objc_setter,
 +    ClassExports, NSZonePtr,
  };
- 
+
  type UIActivityIndicatorViewStyle = NSInteger;
 @@ -16,6 +17,7 @@ type UIActivityIndicatorViewStyle = NSInteger;
  pub struct UIActivityIndicatorViewHostObject {
@@ -3331,7 +3771,7 @@ index 7384f20..d9d899a 100644
 +    hides_when_stopped: bool,
  }
  impl_HostObject_with_superclass!(UIActivityIndicatorViewHostObject);
- 
+
 @@ -29,6 +31,7 @@ pub const CLASSES: ClassExports = objc_classes! {
      let host_object = Box::new(UIActivityIndicatorViewHostObject {
          superclass: Default::default(),
@@ -3343,7 +3783,7 @@ index 7384f20..d9d899a 100644
 @@ -38,6 +41,18 @@ pub const CLASSES: ClassExports = objc_classes! {
      msg![env; this init]
  }
- 
+
 +- (id)initWithFrame:(CGRect)frame {
 +    let this: id = msg_super![env; this initWithFrame:frame];
 +    () = msg![env; this setHidden:true];
@@ -3374,11 +3814,11 @@ index 7384f20..d9d899a 100644
 +        () = msg![env; this setHidden:true];
 +    }
  }
- 
+
  - (bool)isAnimating {
      env.objc.borrow::<UIActivityIndicatorViewHostObject>(this).animating
  }
- 
+
 -- (())setHidesWhenStopped:(bool)_hides {
 -    // TODO
 +- (bool)hidesWhenStopped {
@@ -3395,7 +3835,7 @@ index 7384f20..d9d899a 100644
 +        () = msg![env; this setHidden:hides];
 +    }
  }
- 
+
  @end
 diff --git a/src/frameworks/uikit/ui_bar_button_item.rs b/src/frameworks/uikit/ui_bar_button_item.rs
 new file mode 100644
@@ -3598,13 +4038,13 @@ index 840d763..a1330e3 100644
          origin: CGPoint { x: 0.0, y: 0.0 },
          size: CGSize { width: width as f32, height: height as f32 },
 diff --git a/src/frameworks/uikit/ui_touch.rs b/src/frameworks/uikit/ui_touch.rs
-index 1461475..5d662e0 100644
+index 1461475..578ee5f 100644
 --- a/src/frameworks/uikit/ui_touch.rs
 +++ b/src/frameworks/uikit/ui_touch.rs
 @@ -108,8 +108,21 @@ pub const CLASSES: ClassExports = objc_classes! {
- 
+
  };
- 
+
 +/// Only an accepted direction touch should drive game-specific compatibility.
 +pub(super) fn keyboard_direction_view(env: &Environment) -> Option<id> {
 +    let touch = *env
@@ -3629,7 +4069,7 @@ index 1461475..5d662e0 100644
      }
 +    release(env, map_delegate);
  }
- 
+
  fn handle_touches_down(env: &mut Environment, map: HashMap<FingerId, Coords>) {
 +    let keyboard_touch = map.keys().any(|finger| {
 +        matches!(
@@ -3639,10 +4079,10 @@ index 1461475..5d662e0 100644
 +    });
      // UIKit creates and drains autorelease pools when handling events.
      let pool: id = msg_class![env; NSAutoreleasePool new];
- 
+
 @@ -258,6 +278,15 @@ fn handle_touches_down(env: &mut Environment, map: HashMap<FingerId, Coords>) {
          }
- 
+
          let is_multi_touch_enabled: bool = msg![env; view isMultipleTouchEnabled];
 +        if keyboard_touch {
 +            log!(
@@ -3656,6 +4096,55 @@ index 1461475..5d662e0 100644
          if !is_multi_touch_enabled {
              // When a view has multi-touch disabled, it can only have one active
              // touch at once. So, we can only report a new touch to the view if
+@@ -365,6 +394,13 @@ fn handle_touches_move(env: &mut Environment, map: HashMap<FingerId, Coords>) {
+
+         let _: () = msg![env; touches addObject:touch];
+
++        if is_detached_rebellion_touch_view(env, view) {
++            log!(
++                "Discarding queued touch for detached 8-Bit Rebellion view {:?}",
++                view
++            );
++            continue;
++        }
+         if let Entry::Vacant(e) = view_touches.entry(view) {
+             let touches: id = msg_class![env; NSMutableSet allocWithZone:(MutVoidPtr::null())];
+             e.insert(touches);
+@@ -460,6 +496,19 @@ fn handle_touches_up(env: &mut Environment, map: HashMap<FingerId, Coords>) {
+
+         let _: () = msg![env; touches addObject:touch];
+
++        if is_detached_rebellion_touch_view(env, view) {
++            log!(
++                "Discarding queued touch for detached 8-Bit Rebellion view {:?}",
++                view
++            );
++            env.framework_state
++                .uikit
++                .ui_touch
++                .current_touches
++                .remove(&finger_id);
++            release(env, touch);
++            continue;
++        }
+         if let Entry::Vacant(e) = view_touches.entry(view) {
+             let touches: id = msg_class![env; NSMutableSet allocWithZone:(MutVoidPtr::null())];
+             e.insert(touches);
+@@ -491,3 +540,14 @@ fn handle_touches_up(env: &mut Environment, map: HashMap<FingerId, Coords>) {
+
+     release(env, pool);
+ }
++
++fn is_detached_rebellion_touch_view(env: &mut Environment, view: id) -> bool {
++    if view == nil
++        || env.bundle.bundle_identifier() != "com.alife.linkinpark"
++        || env.bundle.bundle_version() != "1.4.5"
++    {
++        return false;
++    }
++    let window: id = msg![env; view window];
++    window == nil
++}
 diff --git a/src/frameworks/uikit/ui_view.rs b/src/frameworks/uikit/ui_view.rs
 index b4dc3af..ff2ab1b 100644
 --- a/src/frameworks/uikit/ui_view.rs
@@ -3687,7 +4176,7 @@ index b4dc3af..ff2ab1b 100644
 @@ -124,6 +127,20 @@ pub fn set_view_controller(env: &mut Environment, view: id, controller: id) {
      host_obj.view_controller = controller;
  }
- 
+
 +/// Process requests coalesced by `setNeedsLayout` on the main run loop.
 +pub fn layout_pending_views(env: &mut Environment) {
 +    let views = env.framework_state.uikit.ui_view.views.clone();
@@ -3708,7 +4197,7 @@ index b4dc3af..ff2ab1b 100644
 @@ -448,6 +465,27 @@ pub const CLASSES: ClassExports = objc_classes! {
      // nothing.
  }
- 
+
 +- (())setNeedsLayout {
 +    env.objc.borrow_mut::<UIViewHostObject>(this).needs_layout = true;
 +}
@@ -3739,7 +4228,7 @@ index b4dc3af..ff2ab1b 100644
          multiple_touch_enabled: _,
 +        needs_layout: _,
      } = std::mem::take(env.objc.borrow_mut(this));
- 
+
      release(env, layer);
 diff --git a/src/frameworks/uikit/ui_view/ui_navigation_bar.rs b/src/frameworks/uikit/ui_view/ui_navigation_bar.rs
 new file mode 100644
@@ -3863,12 +4352,12 @@ index 7271750..74327c4 100644
 +        keyboard_type: _,
 +        input_traits: _,
      } = std::mem::take(env.objc.borrow_mut(this));
- 
+
      release(env, font);
 @@ -240,8 +256,49 @@ pub const CLASSES: ClassExports = objc_classes! {
      update_scroll(env, this);
  }
- 
+
 +- (UIReturnKeyType)returnKeyType {
 +    env.objc.borrow::<UITextViewHostObject>(this).input_traits.return_key_type
 +}
@@ -3914,7 +4403,7 @@ index 7271750..74327c4 100644
 +- (())setSecureTextEntry:(bool)enabled {
 +    env.objc.borrow_mut::<UITextViewHostObject>(this).input_traits.secure_text_entry = enabled;
  }
- 
+
  - (())setDataDetectorTypes:(UIDataDetectorTypes)types {
 @@ -258,7 +315,9 @@ pub const CLASSES: ClassExports = objc_classes! {
          font,
@@ -3925,7 +4414,7 @@ index 7271750..74327c4 100644
 +        keyboard_type: _,
 +        input_traits: _,
      } = env.objc.borrow_mut(this);
- 
+
      let (r, g, b, a) = ui_color::get_rgba(&env.objc, text_color);
 diff --git a/src/frameworks/uikit/ui_view/ui_window.rs b/src/frameworks/uikit/ui_view/ui_window.rs
 index 1998df4..8f03ab3 100644
@@ -3946,10 +4435,10 @@ index d0a73bc..8bdb211 100644
 +++ b/src/frameworks/uikit/ui_view_controller.rs
 @@ -23,9 +23,10 @@ use crate::objc::{
  use crate::Environment;
- 
+
  pub mod ui_navigation_controller;
 +pub mod ui_table_view_controller;
- 
+
  #[derive(Default)]
 -struct UIViewControllerHostObject {
 +pub(crate) struct UIViewControllerHostObject {
@@ -3992,10 +4481,18 @@ index 0000000..a2182df
 +
 +};
 diff --git a/src/gles/gles1_on_gl2.rs b/src/gles/gles1_on_gl2.rs
-index 8f99107..e70e97a 100644
+index 8f99107..68aeb2b 100644
 --- a/src/gles/gles1_on_gl2.rs
 +++ b/src/gles/gles1_on_gl2.rs
-@@ -1270,7 +1270,8 @@ impl GLES for GLES1OnGL2<'_> {
+@@ -253,6 +253,7 @@ const GET_PARAMS: ParamTable = ParamTable(&[
+     (gl21::SAMPLE_COVERAGE_VALUE, ParamType::Float, 1),
+     (gl21::SAMPLES, ParamType::Int, 1),
+     (gl21::SCISSOR_BOX, ParamType::Int, 4),
++    (gles11::MAX_RENDERBUFFER_SIZE_OES, ParamType::Int, 1),
+     (gl21::SCISSOR_TEST, ParamType::Boolean, 1),
+     (gl21::SHADE_MODEL, ParamType::Int, 1),
+     (gl21::SMOOTH_LINE_WIDTH_RANGE, ParamType::Float, 2),
+@@ -1270,7 +1271,8 @@ impl GLES for GLES1OnGL2<'_> {
              self.state.pointer_is_fixed_point[1] = true;
              gl21::NormalPointer(gl21::FLOAT, stride, pointer)
          } else {
@@ -4005,6 +4502,19 @@ index 8f99107..e70e97a 100644
              self.state.pointer_is_fixed_point[1] = false;
              gl21::NormalPointer(type_, stride, pointer)
          }
+@@ -2152,3 +2154,12 @@ impl GLES for GLES1OnGL2<'_> {
+         gl21::UnmapBuffer(target)
+     }
+ }
++
++#[cfg(test)]
++#[test]
++fn renderbuffer_limit_query_is_a_single_integer() {
++    assert_eq!(
++        GET_PARAMS.get_type_info(gles11::MAX_RENDERBUFFER_SIZE_OES),
++        (ParamType::Int, 1)
++    );
++}
 diff --git a/src/gles/present.rs b/src/gles/present.rs
 index 2a140b6..5082e48 100644
 --- a/src/gles/present.rs
@@ -4012,7 +4522,7 @@ index 2a140b6..5082e48 100644
 @@ -11,6 +11,18 @@ use super::GLES;
  use crate::matrix::Matrix;
  use std::time::{Duration, Instant};
- 
+
 +/// See the equivalent texture_rotation in ephun/tapHLE (MPL-2.0):
 +/// https://github.com/ephun/tapHLE/blob/trunk/crates/taphle/src/gles/present.rs
 +/// Rotate or reflect UV coordinates about the image centre. Keeping UVs in
@@ -4071,6 +4581,18 @@ index 2a140b6..5082e48 100644
 +        }
 +    }
 +}
+diff --git a/src/lib.rs b/src/lib.rs
+index e616029..4b5c23b 100644
+--- a/src/lib.rs
++++ b/src/lib.rs
+@@ -32,6 +32,7 @@ mod audio;
+ mod bundle;
+ mod cpu;
+ mod debug;
++mod display_settings;
+ mod dyld;
+ mod environment;
+ mod font;
 diff --git a/src/libc/dlfcn.rs b/src/libc/dlfcn.rs
 index 98ea10b..e1f9be2 100644
 --- a/src/libc/dlfcn.rs
@@ -4078,12 +4600,12 @@ index 98ea10b..e1f9be2 100644
 @@ -5,7 +5,7 @@
   */
  //! `dlfcn.h` (`dlopen()` and friends)
- 
+
 -use crate::dyld::{export_c_func, FunctionExports};
 +use crate::dyld::{export_c_func, Dyld, FunctionExports};
  use crate::mem::{ConstPtr, MutVoidPtr, Ptr};
  use crate::Environment;
- 
+
 @@ -35,6 +35,9 @@ fn dlsym(env: &mut Environment, handle: MutVoidPtr, symbol: ConstPtr<u8>) -> Mut
      );
      // For some reason, the symbols passed to dlsym() don't have the leading _.
@@ -4100,11 +4622,11 @@ index d4c8914..1c7ead5 100644
 +++ b/src/libc/unistd.rs
 @@ -73,48 +73,63 @@ fn isatty(env: &mut Environment, fd: FileDescriptor) -> i32 {
  }
- 
+
  fn access(env: &mut Environment, path: ConstPtr<u8>, mode: i32) -> i32 {
 -    // TODO: handle errno properly
      set_errno(env, 0);
- 
+
      let binding = env.mem.cstr_at_utf8(path).unwrap();
      let guest_path = GuestPath::new(&binding);
      let (exists, read, write, execute) = env.fs.access(guest_path);
@@ -4197,7 +4719,28 @@ index d4c8914..1c7ead5 100644
 +        assert_eq!(access_result((true, true, true, true), 8), Err(EINVAL));
      }
  }
- 
+
+diff --git a/src/objc/messages.rs b/src/objc/messages.rs
+index 03a6f99..4c2789d 100644
+--- a/src/objc/messages.rs
++++ b/src/objc/messages.rs
+@@ -278,7 +278,15 @@ Type mismatch when sending message {} to {:?}!
+                     }
+                     // We can't create a new stack frame, because that would
+                     // interfere with pass-through of stack arguments.
+-                    IMP::Guest(guest_imp) => guest_imp.call_without_pushing_stack_frame(env),
++                    IMP::Guest(guest_imp) => {
++                        let guest_imp = *guest_imp;
++                        if name == "Scrolltable"
++                            && selector.as_str(&env.mem) == "drawWithOffsetX:OffsetY:"
++                        {
++                            crate::frameworks::uikit::rebellion_scroll::record_draw(env, receiver);
++                        }
++                        guest_imp.call_without_pushing_stack_frame(env)
++                    }
+                 }
+                 return;
+             } else {
 diff --git a/src/objc/objects.rs b/src/objc/objects.rs
 index 60b20ca..247c3bc 100644
 --- a/src/objc/objects.rs
@@ -4205,7 +4748,7 @@ index 60b20ca..247c3bc 100644
 @@ -239,6 +239,16 @@ impl super::ObjC {
          self.objects.get(&object).map(|entry| &*entry.host_object)
      }
- 
+
 +    /// Snapshot live instances of an exact Objective-C class. The snapshot
 +    /// allows callers to send messages that may deallocate an instance.
 +    pub fn instances_of_class(&self, class: Class, mem: &Mem) -> Vec<id> {
@@ -4220,11 +4763,15 @@ index 60b20ca..247c3bc 100644
      /// no such object, or if downcasting fails.
      pub fn borrow<T: AnyHostObject + 'static>(&self, object: id) -> &T {
 diff --git a/src/options.rs b/src/options.rs
-index 7f13c7f..47df420 100644
+index 7f13c7f..73c2424 100644
 --- a/src/options.rs
 +++ b/src/options.rs
-@@ -37,6 +37,8 @@ pub struct Options {
+@@ -35,8 +35,12 @@ pub enum Button {
+ #[derive(Clone)]
+ pub struct Options {
      pub fullscreen: bool,
++    pub display_resolution: Option<(u32, u32)>,
++    pub display_service: bool,
      pub device_family: Option<DeviceFamily>,
      pub initial_orientation: DeviceOrientation,
 +    pub landscape_content_layout: bool,
@@ -4232,7 +4779,7 @@ index 7f13c7f..47df420 100644
      pub scale_hack: NonZeroU32,
      pub deadzone: f32,
      pub analog_stick_tilt_controls: bool,
-@@ -46,6 +48,7 @@ pub struct Options {
+@@ -46,6 +50,7 @@ pub struct Options {
      pub y_tilt_offset: f32,
      pub button_to_touch: HashMap<Button, (f32, f32)>,
      pub dpad_to_touch: Option<(f32, f32, f32, f32)>,
@@ -4240,8 +4787,12 @@ index 7f13c7f..47df420 100644
      pub stick_to_touch: Option<(f32, f32, f32, f32)>,
      pub stabilize_virtual_cursor: Option<(f32, f32)>,
      pub gles1_implementation: Option<GLESImplementation>,
-@@ -70,6 +73,8 @@ impl Default for Options {
+@@ -68,8 +73,12 @@ impl Default for Options {
+     fn default() -> Self {
+         Options {
              fullscreen: false,
++            display_resolution: None,
++            display_service: false,
              device_family: None,
              initial_orientation: DeviceOrientation::Portrait,
 +            landscape_content_layout: false,
@@ -4249,7 +4800,7 @@ index 7f13c7f..47df420 100644
              scale_hack: NonZeroU32::new(1).unwrap(),
              analog_stick_tilt_controls: true,
              deadzone: 0.1,
-@@ -79,6 +84,7 @@ impl Default for Options {
+@@ -79,6 +88,7 @@ impl Default for Options {
              y_tilt_offset: 0.0,
              button_to_touch: HashMap::new(),
              dpad_to_touch: None,
@@ -4257,7 +4808,7 @@ index 7f13c7f..47df420 100644
              stick_to_touch: None,
              stabilize_virtual_cursor: None,
              gles1_implementation: None,
-@@ -122,6 +128,12 @@ impl Options {
+@@ -122,6 +132,12 @@ impl Options {
              self.initial_orientation = DeviceOrientation::LandscapeLeft;
          } else if arg == "--landscape-right" {
              self.initial_orientation = DeviceOrientation::LandscapeRight;
@@ -4270,8 +4821,23 @@ index 7f13c7f..47df420 100644
          } else if let Some(value) = arg.strip_prefix("--device-family=") {
              let parsed =
                  DeviceFamily::try_from(value).map_err(|_| "Invalid device family".to_string())?;
+diff --git a/src/paths.rs b/src/paths.rs
+index d0ab20b..e95666f 100644
+--- a/src/paths.rs
++++ b/src/paths.rs
+@@ -113,6 +113,10 @@ pub const SANDBOX_DIR: &str = "touchHLE_sandbox";
+ /// Get a platform-specific base path needed for accessing touchHLE's
+ /// user-modifiable files. This is empty on platforms other than Android.
+ pub fn user_data_base_path() -> Cow<'static, Path> {
++    #[cfg(feature = "rebellion-test-tools")]
++    if let Some(path) = std::env::var_os("BEBELLION_TEST_DATA_DIR") {
++        return Cow::Owned(PathBuf::from(path));
++    }
+     #[cfg(target_os = "android")]
+     unsafe {
+         // This is an exception to the rule that SDL2 should only be used
 diff --git a/src/window.rs b/src/window.rs
-index d4eae99..295617e 100644
+index d4eae99..eb5987c 100644
 --- a/src/window.rs
 +++ b/src/window.rs
 @@ -18,11 +18,12 @@ use crate::image::Image;
@@ -4348,11 +4914,11 @@ index d4eae99..295617e 100644
 +    KeyboardAttack,
  }
  pub type Coords = (f32, f32);
- 
+
 @@ -140,6 +181,112 @@ struct DpadState {
      active: bool,
  }
- 
+
 +#[derive(Copy, Clone, Eq, PartialEq, Hash, Debug)]
 +enum GameKey {
 +    A,
@@ -4462,19 +5028,82 @@ index d4eae99..295617e 100644
  #[derive(Debug)]
  pub enum TextInputEvent {
      Text(String),
-@@ -160,12 +307,102 @@ pub enum Event {
+@@ -160,12 +307,173 @@ pub enum Event {
      TouchesDown(HashMap<FingerId, Coords>),
      TouchesMove(HashMap<FingerId, Coords>),
      TouchesUp(HashMap<FingerId, Coords>),
 +    /// Activate the visible door entry in 8-Bit Rebellion.
 +    ActivateDoor,
 +    ToggleGameMenu,
++    ApplyDisplaySettings(crate::display_settings::Settings),
++    Scroll {
++        cursor: Coords,
++        delta: f32,
++    },
++    #[cfg(feature = "rebellion-test-tools")]
++    TestCheat(u8),
++
      /// User pressed F12, requesting that execution be paused and the debugger
      /// take over.
      EnterDebugger,
      TextInput(TextInputEvent),
  }
- 
+
++/// Snapshot the macOS preference once when the window is created.
++fn natural_scroll_preference() -> Option<bool> {
++    #[cfg(target_os = "macos")]
++    {
++        let preference = std::process::Command::new("/usr/bin/defaults")
++            .args(["read", "-g", "com.apple.swipescrolldirection"])
++            .output()
++            .ok()
++            .filter(|output| output.status.success())
++            .and_then(
++                |output| match std::str::from_utf8(&output.stdout).ok()?.trim() {
++                    "1" | "true" => Some(true),
++                    "0" | "false" => Some(false),
++                    _ => None,
++                },
++            );
++        match preference {
++            Some(enabled) => {
++                log!("macOS natural scrolling at startup: {}", enabled);
++            }
++            None => {
++                log!("macOS natural scrolling preference unavailable; using OS event direction");
++            }
++        }
++        preference
++    }
++    #[cfg(not(target_os = "macos"))]
++    {
++        Some(false)
++    }
++}
++
++fn wheel_amount(amount: f32, flipped: bool, natural: Option<bool>) -> f32 {
++    // Cocoa's delta already follows the OS setting. Flipped identifies the
++    // device-relative sign; normalize it before applying the startup snapshot.
++    // If the preference cannot be read, retain the OS-provided delta.
++    match natural {
++        Some(natural) if flipped != natural => -amount,
++        _ => amount,
++    }
++}
++
++#[cfg(test)]
++#[test]
++fn wheel_direction_respects_natural_scroll_snapshot_and_os_fallback() {
++    for amount in [-1.0, 1.0, -0.25, 0.25] {
++        assert_eq!(wheel_amount(amount, false, Some(false)), amount);
++        assert_eq!(wheel_amount(amount, true, Some(false)), -amount);
++        assert_eq!(wheel_amount(amount, false, Some(true)), -amount);
++        assert_eq!(wheel_amount(amount, true, Some(true)), amount);
++        assert_eq!(wheel_amount(amount, false, None), amount);
++        assert_eq!(wheel_amount(amount, true, None), amount);
++    }
++}
++
 +#[derive(Default)]
 +struct VideoTouchFilter {
 +    active: bool,
@@ -4486,6 +5115,7 @@ index d4eae99..295617e 100644
 +impl VideoTouchFilter {
 +    fn filter(&mut self, event: Event) -> Option<Event> {
 +        match event {
++            Event::Scroll { .. } if self.active => None,
 +            Event::TouchesDown(touches) if self.active => {
 +                if !touches.is_empty() {
 +                    self.skip_requested = true;
@@ -4538,6 +5168,13 @@ index d4eae99..295617e 100644
 +        ] {
 +            let mut filter = VideoTouchFilter::default();
 +            filter.active = true;
++            assert!(filter
++                .filter(Event::Scroll {
++                    cursor: (10.0, 20.0),
++                    delta: -32.0
++                })
++                .is_none());
++            assert!(!filter.skip_requested);
 +            assert!(filter.filter(touch_down(finger)).is_none());
 +            assert!(filter.skip_requested);
 +            filter.active = false;
@@ -4565,11 +5202,13 @@ index d4eae99..295617e 100644
  pub enum BatteryState {
      Unknown,
      OnBattery,
-@@ -229,13 +466,19 @@ pub struct Window {
+@@ -229,13 +537,21 @@ pub struct Window {
      /// [Self::rotatable_fullscreen] returns [true].
      fullscreen: bool,
      scale_hack: NonZeroU32,
 +    landscape_content_layout: bool,
++    display_resolution: Option<(u32, u32)>,
++    natural_scroll: Option<bool>,
      internal_gl_ins: Option<Box<dyn GLESContext>>,
      splash_image: Option<Image>,
 +    launch_image_orientation: DeviceOrientation,
@@ -4585,11 +5224,25 @@ index d4eae99..295617e 100644
      stick_active: bool,
      _sensor_ctx: sdl2::SensorSubsystem,
      accelerometer: Option<sdl2::sensor::Sensor>,
-@@ -378,8 +621,12 @@ impl Window {
+@@ -320,8 +636,9 @@ impl Window {
+                 .unwrap();
+             window
+         } else {
+-            let (width, height) =
+-                size_for_orientation(device_family, device_orientation, scale_hack);
++            let (width, height) = options.display_resolution.unwrap_or_else(|| {
++                size_for_orientation(device_family, device_orientation, scale_hack)
++            });
+             let window = video_ctx
+                 .window(title, width, height)
+                 .position_centered()
+@@ -378,8 +695,14 @@ impl Window {
              viewport_y_offset: 0,
              fullscreen,
              scale_hack,
 +            landscape_content_layout: options.landscape_content_layout,
++            display_resolution: options.display_resolution,
++            natural_scroll: natural_scroll_preference(),
              internal_gl_ins: None,
              splash_image: launch_image,
 +            launch_image_orientation: device_orientation,
@@ -4598,7 +5251,7 @@ index d4eae99..295617e 100644
              device_family,
              device_orientation,
              controller_ctx,
-@@ -391,6 +638,8 @@ impl Window {
+@@ -391,6 +714,8 @@ impl Window {
                  down: false,
                  active: false,
              },
@@ -4607,7 +5260,7 @@ index d4eae99..295617e 100644
              stick_active: false,
              _sensor_ctx: sensor_ctx,
              accelerometer,
-@@ -449,16 +698,22 @@ impl Window {
+@@ -449,16 +774,22 @@ impl Window {
              } else {
                  window.viewport()
              };
@@ -4640,17 +5293,55 @@ index d4eae99..295617e 100644
              // Round to match touch precision of official devices.
              (out_x.round(), out_y.round())
          }
-@@ -542,7 +797,8 @@ impl Window {
+@@ -542,7 +873,8 @@ impl Window {
                  _ => {}
              }
- 
+
 -            self.event_queue.push_back(match event {
 +            let mut keyboard_release = None;
 +            let mapped_event = match event {
                  E::Quit { .. } => Event::Quit,
                  E::MouseButtonDown {
                      x,
-@@ -760,6 +1016,9 @@ impl Window {
+@@ -571,6 +903,37 @@ impl Window {
+                     log_dbg!("MouseButtonUp x {}, y {}, coords {:?}", x, y, coords);
+                     Event::TouchesUp(HashMap::from([(FingerId::Mouse, coords)]))
+                 }
++                E::MouseWheel {
++                    y,
++                    precise_y,
++                    direction,
++                    mouse_x,
++                    mouse_y,
++                    ..
++                } if options.keyboard_game_controls => {
++                    if self.event_pump.mouse_state().left() {
++                        continue;
++                    }
++                    let amount = if precise_y == 0.0 {
++                        y as f32
++                    } else {
++                        precise_y
++                    };
++                    let amount = wheel_amount(
++                        amount,
++                        direction == sdl2::mouse::MouseWheelDirection::Flipped,
++                        self.natural_scroll,
++                    );
++                    if !amount.is_finite() || amount == 0.0 {
++                        continue;
++                    }
++                    let cursor =
++                        transform_input_coords(self, (mouse_x as f32, mouse_y as f32), false);
++                    Event::Scroll {
++                        cursor,
++                        delta: amount * 32.0,
++                    }
++                }
+                 E::ControllerDeviceAdded { which, .. } => {
+                     self.controller_added(which);
+                     continue;
+@@ -760,6 +1123,9 @@ impl Window {
                      let curr_timestamp = timestamp;
                      let abs_coords = finger_absolute_coords(self, (x, y));
                      let coords = transform_input_coords(self, abs_coords, false);
@@ -4660,7 +5351,7 @@ index d4eae99..295617e 100644
                      log_dbg!("Finger event x {}, y {}, coords {:?}", x, y, coords);
                      let mut map = HashMap::from([(FingerId::Touch(finger_id), coords)]);
                      while let Some(next) = self.event_pump.poll_event() {
-@@ -824,6 +1083,120 @@ impl Window {
+@@ -824,6 +1190,160 @@ impl Window {
                      echo!("F12 pressed, EnterDebugger event queued.");
                      Event::EnterDebugger
                  }
@@ -4692,6 +5383,46 @@ index d4eae99..295617e 100644
 +                        continue;
 +                    }
 +                    Event::TouchesUp(touches)
++                }
++                E::KeyDown {
++                    scancode: Some(sdl2::keyboard::Scancode::F9),
++                    repeat: false,
++                    ..
++                } if options.display_service => {
++                    let current = crate::display_settings::Settings::from_options(options);
++                    let Some(settings) = crate::display_settings::show(&self.window, current) else {
++                        continue;
++                    };
++                    Event::ApplyDisplaySettings(settings)
++                }
++                #[cfg(feature = "rebellion-test-tools")]
++                E::KeyDown {
++                    scancode: Some(key),
++                    repeat: false,
++                    ..
++                } if matches!(
++                    key,
++                    sdl2::keyboard::Scancode::F5
++                        | sdl2::keyboard::Scancode::F6
++                        | sdl2::keyboard::Scancode::F7
++                ) =>
++                {
++                    Event::TestCheat(match key {
++                        sdl2::keyboard::Scancode::F5 => 1,
++                        sdl2::keyboard::Scancode::F6 => 2,
++                        _ => 3,
++                    })
++                }
++                #[cfg(feature = "rebellion-test-tools")]
++                E::KeyDown {
++                    scancode: Some(sdl2::keyboard::Scancode::F8),
++                    repeat: false,
++                    ..
++                } => {
++                    let Some(action) = show_rebellion_test_menu(&self.window) else {
++                        continue;
++                    };
++                    Event::TestCheat(action)
 +                }
 +                E::KeyDown {
 +                    keycode, scancode, ..
@@ -4781,7 +5512,7 @@ index d4eae99..295617e 100644
                  E::KeyDown {
                      keycode: Some(sdl2::keyboard::Keycode::Backspace),
                      ..
-@@ -843,7 +1216,11 @@ impl Window {
+@@ -843,7 +1363,11 @@ impl Window {
                      Event::TextInput(TextInputEvent::Text(text))
                  }
                  _ => continue,
@@ -4792,12 +5523,12 @@ index d4eae99..295617e 100644
 +            }
 +            self.event_queue.push_back(mapped_event);
          }
- 
+
          if controller_updated {
-@@ -868,12 +1245,22 @@ impl Window {
+@@ -868,12 +1392,22 @@ impl Window {
          }
      }
- 
+
 +    pub(crate) fn held_keyboard_direction(&self) -> Option<crate::options::Button> {
 +        self.keyboard_direction_active
 +    }
@@ -4818,10 +5549,10 @@ index d4eae99..295617e 100644
 +            }
 +        }
      }
- 
+
      fn controller_added(&mut self, joystick_idx: u32) {
-@@ -1203,12 +1590,18 @@ impl Window {
- 
+@@ -1203,12 +1737,18 @@ impl Window {
+
          // OpenGL ES expects bottom-to-top row order for image data, but our
          // image data will be top-to-bottom. A reflection transform compensates.
 -        let matrix = self.rotation_matrix().multiply(&Matrix::y_flip());
@@ -4835,14 +5566,14 @@ index d4eae99..295617e 100644
 +        let matrix = rotation.multiply(&Matrix::y_flip());
          let (vx, vy, vw, vh) = self.viewport();
          let viewport = (vx, vy + self.viewport_y_offset(), vw, vh);
- 
+
          let image = self.splash_image.as_ref().unwrap();
 -
          unsafe {
              let mut gl_ctx = self
                  .internal_gl_ins
-@@ -1265,7 +1658,96 @@ impl Window {
- 
+@@ -1265,7 +1805,96 @@ impl Window {
+
      /// Swap front-buffer and back-buffer so the result of OpenGL rendering is
      /// presented.
 -    pub fn swap_window(&self) {
@@ -4938,8 +5669,105 @@ index d4eae99..295617e 100644
 +        }
          self.window.gl_swap_window();
      }
- 
-@@ -1400,12 +1882,16 @@ impl Window {
+
+@@ -1285,7 +1914,9 @@ impl Window {
+                 set_sdl2_orientation(new_orientation);
+                 rotate_fullscreen_size(new_orientation, self.window.size())
+             } else {
+-                size_for_orientation(self.device_family, new_orientation, self.scale_hack)
++                self.display_resolution.unwrap_or_else(|| {
++                    size_for_orientation(self.device_family, new_orientation, self.scale_hack)
++                })
+             };
+
+             // macOS quirk: when resizing the window, the new framebuffer's size
+@@ -1354,6 +1985,57 @@ impl Window {
+         )
+     }
+
++    pub(crate) fn sdl_window(&self) -> &sdl2::video::Window {
++        &self.window
++    }
++
++    pub(crate) fn apply_display_settings(
++        &mut self,
++        settings: crate::display_settings::Settings,
++    ) -> Result<(), String> {
++        assert!(self.on_main_stack);
++        let old_size = self.window.size();
++        let old_fullscreen = self.fullscreen;
++        let (width, height) = crate::display_settings::RESOLUTIONS[settings.resolution];
++        let mode = if settings.fullscreen {
++            sdl2::video::FullscreenType::Desktop
++        } else {
++            sdl2::video::FullscreenType::Off
++        };
++        let result = self.window.set_fullscreen(mode).and_then(|_| {
++            if !settings.fullscreen {
++                self.window
++                    .set_size(width, height)
++                    .map_err(|e| e.to_string())
++            } else {
++                Ok(())
++            }
++        });
++        if let Err(error) = result {
++            let _ = self.window.set_fullscreen(if old_fullscreen {
++                sdl2::video::FullscreenType::Desktop
++            } else {
++                sdl2::video::FullscreenType::Off
++            });
++            if !old_fullscreen {
++                let _ = self.window.set_size(old_size.0, old_size.1);
++            }
++            return Err(error);
++        }
++        #[cfg(target_os = "macos")]
++        {
++            // SDL's window/fullscreen resize updates the drawable. The old
++            // orientation-resize workaround must not retain the fullscreen
++            // height, or the windowed frame is drawn outside its drawable.
++            self.max_height = self.window.size().1;
++            self.viewport_y_offset = 0;
++        }
++        self.fullscreen = settings.fullscreen;
++        self.display_resolution = Some((width, height));
++        self.scale_hack = NonZeroU32::new(settings.scale).unwrap();
++        Ok(())
++    }
++
+     /// Get the region of the on-screen window (x, y, width, height) used to
+     /// display the app content.
+     ///
+@@ -1362,6 +2044,27 @@ impl Window {
+     pub fn viewport(&self) -> (u32, u32, u32, u32) {
+         let (app_width, app_height) =
+             size_for_orientation(self.device_family, self.device_orientation, self.scale_hack);
++        if let Some((width, height)) = self.display_resolution {
++            let (screen_width, screen_height) = self.window.drawable_size();
++            let output = if self.fullscreen {
++                let scale = (screen_width as f64 / width as f64)
++                    .min(screen_height as f64 / height as f64)
++                    .min(1.0);
++                (
++                    (width as f64 * scale).round() as u32,
++                    (height as f64 * scale).round() as u32,
++                )
++            } else {
++                (screen_width, screen_height)
++            };
++            let (x, y, w, h) = crate::display_settings::fit(output, (app_width, app_height));
++            return (
++                x + (screen_width - output.0) / 2,
++                y + (screen_height - output.1) / 2,
++                w,
++                h,
++            );
++        }
+         if !self.fullscreen && !Self::rotatable_fullscreen() {
+             return (0, 0, app_width, app_height);
+         }
+@@ -1400,12 +2103,16 @@ impl Window {
      /// rotating texture co-ordinates to display the image in the window; when
      /// rotating input co-ordinates, invert the matrix.
      pub fn rotation_matrix(&self) -> Matrix<2> {
@@ -4960,8 +5788,39 @@ index d4eae99..295617e 100644
 +            launch.dimensions() == image.dimensions() && launch.pixels() == image.pixels()
 +        })
      }
- 
+
      pub fn is_screen_saver_enabled(&self) -> bool {
+@@ -1544,3 +2251,30 @@ pub fn get_preferred_country_codes(env: &mut Environment) -> Vec<String> {
+             .collect()
+     })
+ }
++
++/// This entry point exists only in the explicitly opted-in test binary.
++#[cfg(feature = "rebellion-test-tools")]
++fn show_rebellion_test_menu(window: &sdl2::video::Window) -> Option<u8> {
++    use sdl2::messagebox::*;
++    let labels = [
++        "Close",
++        "Coins: 9999 / undo",
++        "Posters: collect / undo",
++        "Activate next achievement",
++    ];
++    let buttons: Vec<_> = labels
++        .iter()
++        .enumerate()
++        .map(|(i, text)| ButtonData {
++            flags: MessageBoxButtonFlag::NOTHING,
++            button_id: i as i32,
++            text,
++        })
++        .collect();
++    match show_message_box(MessageBoxFlag::INFORMATION, &buttons,
++        "8-Bit Rebellion test tools",
++        "Use in the playable world with movement keys released.\nCoins and posters toggle back to their original values.\nAchievements: one per click, IDs 22000-22015; see the run log.\nRestart the test session to undo all test changes.", Some(window), None) {
++        Ok(ClickedButton::CustomButton(button)) if button.button_id > 0 => Some(button.button_id as u8),
++        _ => None,
++    }
++}
 diff --git a/tests/TestApp_source/cli_tests.m b/tests/TestApp_source/cli_tests.m
 index 651258d..74c200c 100644
 --- a/tests/TestApp_source/cli_tests.m
@@ -4977,7 +5836,7 @@ index 651258d..74c200c 100644
 @@ -6464,6 +6465,22 @@ int test_fcvt() {
    return 0;
  }
- 
+
 +extern void *UIApplicationDidReceiveMemoryWarningNotification;
 +
 +int test_dlsym_constant() {
@@ -5004,4 +5863,678 @@ index 651258d..74c200c 100644
 +    FUNC_DEF(test_dlsym_constant),
  };
  // clang-format on
- 
+
+diff --git a/src/display_settings.rs b/src/display_settings.rs
+new file mode 100644
+--- /dev/null
++++ b/src/display_settings.rs
+@@ -0,0 +1,299 @@
++/*
++ * This Source Code Form is subject to the terms of the Mozilla Public
++ * License, v. 2.0. If a copy of the MPL was not distributed with this
++ * file, You can obtain one at https://mozilla.org/MPL/2.0/.
++ */
++//! Persistent host display preferences for the inspected game.
++use std::num::NonZeroU32;
++use std::path::PathBuf;
++
++pub const RESOLUTIONS: [(u32, u32); 6] = [
++    (480, 320),
++    (960, 640),
++    (1280, 720),
++    (1920, 1080),
++    (2560, 1440),
++    (3840, 2160),
++];
++
++#[derive(Clone, Copy, Debug, PartialEq, Eq)]
++pub struct Settings {
++    pub resolution: usize,
++    pub fullscreen: bool,
++    pub scale: u32,
++}
++impl Default for Settings {
++    fn default() -> Self {
++        Self {
++            resolution: 0,
++            fullscreen: false,
++            scale: 1,
++        }
++    }
++}
++impl Settings {
++    fn encode(self) -> String {
++        format!(
++            "version=1\nresolution={}\nfullscreen={}\nscale={}\n",
++            self.resolution,
++            u8::from(self.fullscreen),
++            self.scale
++        )
++    }
++    fn decode(text: &str) -> Option<Self> {
++        let mut lines = text.lines();
++        if lines.next()? != "version=1" {
++            return None;
++        }
++        let resolution = lines
++            .next()?
++            .strip_prefix("resolution=")?
++            .parse::<usize>()
++            .ok()?;
++        let fullscreen = match lines.next()?.strip_prefix("fullscreen=")? {
++            "0" => false,
++            "1" => true,
++            _ => return None,
++        };
++        let scale = lines.next()?.strip_prefix("scale=")?.parse::<u32>().ok()?;
++        if lines.next().is_some() || resolution >= RESOLUTIONS.len() || !(1..=4).contains(&scale) {
++            return None;
++        }
++        Some(Self {
++            resolution,
++            fullscreen,
++            scale,
++        })
++    }
++    /// Read live state, independently of whether its last disk save succeeded.
++    pub fn from_options(options: &crate::options::Options) -> Self {
++        let scale = options.scale_hack.get();
++        let output = options
++            .display_resolution
++            .unwrap_or((480 * scale, 320 * scale));
++        Self {
++            resolution: RESOLUTIONS
++                .iter()
++                .position(|&size| size == output)
++                .unwrap_or(0),
++            fullscreen: options.fullscreen,
++            scale: scale.clamp(1, 4),
++        }
++    }
++    pub fn apply(self, options: &mut crate::options::Options) {
++        options.display_resolution = Some(RESOLUTIONS[self.resolution]);
++        options.fullscreen = self.fullscreen;
++        options.scale_hack = NonZeroU32::new(self.scale).unwrap();
++    }
++}
++fn path() -> PathBuf {
++    // The test launcher creates a new game-save sandbox on every run, but
++    // host display preferences should survive a launcher restart.
++    #[cfg(feature = "rebellion-test-tools")]
++    if let Some(directory) = std::env::var_os("BEBELLION_DISPLAY_SETTINGS_DIR") {
++        return PathBuf::from(directory).join("8beet-display-settings-v1");
++    }
++    crate::paths::user_data_base_path().join("8beet-display-settings-v1")
++}
++pub fn load_saved() -> Option<Settings> {
++    match std::fs::read_to_string(path()) {
++        Ok(text) => {
++            let settings = Settings::decode(&text);
++            if settings.is_none() {
++                log!("Invalid display preferences; keeping launcher defaults");
++            }
++            settings
++        }
++        Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
++        Err(error) => {
++            log!("Could not read display preferences: {}", error);
++            None
++        }
++    }
++}
++fn save(settings: Settings) -> Result<(), String> {
++    let path = path();
++    let temp = path.with_extension("tmp");
++    let mut file = std::fs::File::create(&temp).map_err(|e| e.to_string())?;
++    use std::io::Write;
++    file.write_all(settings.encode().as_bytes())
++        .and_then(|_| file.sync_all())
++        .map_err(|e| e.to_string())?;
++    drop(file);
++    // std::fs::rename replaces existing files on Windows and macOS.
++    std::fs::rename(temp, path).map_err(|e| e.to_string())
++}
++fn choose(window: &sdl2::video::Window, title: &str, text: &str, labels: &[&str]) -> Option<usize> {
++    use sdl2::messagebox::*;
++    let buttons: Vec<_> = labels
++        .iter()
++        .enumerate()
++        .map(|(i, text)| ButtonData {
++            flags: if i == 0 {
++                MessageBoxButtonFlag::ESCAPEKEY_DEFAULT
++            } else {
++                MessageBoxButtonFlag::NOTHING
++            },
++            button_id: i as i32,
++            text,
++        })
++        .collect();
++    match show_message_box(
++        MessageBoxFlag::INFORMATION,
++        &buttons,
++        title,
++        text,
++        Some(window),
++        None,
++    ) {
++        Ok(ClickedButton::CustomButton(button)) => Some(button.button_id as usize),
++        Ok(_) => None,
++        Err(error) => {
++            log!("Could not show Display Settings: {}", error);
++            None
++        }
++    }
++}
++pub fn show(window: &sdl2::video::Window, current: Settings) -> Option<Settings> {
++    let mut pending = current;
++    loop {
++        let (w, h) = RESOLUTIONS[pending.resolution];
++        let summary = format!("Pending: {} x {} | {} | render {}x\nApply changes the current game immediately.\nGame proportions are preserved; wide output has side borders.", w, h, if pending.fullscreen { "Fullscreen" } else { "Windowed" }, pending.scale);
++        match choose(window, "Display Settings", &summary, &["Cancel", "Resolution", "Window mode", "Render quality", "Reset to defaults", "Apply"]) {
++            Some(1) => {
++                if let Some(index @ 1..=6) = choose(window, "Output resolution", "Choose an output size. Fullscreen uses the desktop display with a centered output area when it fits.", &["Back", "480 x 320 (Original)", "960 x 640", "1280 x 720 (HD)", "1920 x 1080 (Full HD)", "2560 x 1440 (QHD)", "3840 x 2160 (4K)"]) { pending.resolution = index - 1; }
++            }
++            Some(2) => match choose(window, "Window mode", "Choose a display mode.", &["Back", "Windowed", "Fullscreen"]) { Some(1) => pending.fullscreen = false, Some(2) => pending.fullscreen = true, _ => {} },
++            Some(3) => {
++                if let Some(scale @ 1..=4) = choose(window, "Render quality", "Higher scales increase render resolution and GPU work. Original sprites keep their source detail.", &["Back", "1x (Original)", "2x", "3x", "4x"]) { pending.scale = scale as u32; }
++            }
++            Some(4) => pending = Settings::default(),
++            Some(5) => return Some(pending),
++            _ => return None,
++        }
++    }
++}
++
++pub fn apply(env: &mut crate::Environment, settings: Settings) {
++    if !env.options.display_service {
++        return;
++    }
++    let old_scale = env.options.scale_hack.get();
++    if let Err(error) =
++        crate::frameworks::opengles::resize_renderbuffers(env, old_scale, settings.scale)
++    {
++        log!("Display settings were not applied: {}", error);
++        env.on_parent_stack_in_coroutine(move |window, _| {
++            let _ = choose(
++                window.sdl_window(),
++                "Display Settings",
++                &format!("Settings were not applied: {}", error),
++                &["OK"],
++            );
++        });
++        return;
++    }
++    let result = env.on_parent_stack_in_coroutine(move |window, options| {
++        window.apply_display_settings(settings)?;
++        settings.apply(options);
++        Ok::<_, String>(())
++    });
++    if let Err(error) = result {
++        let _ = crate::frameworks::opengles::resize_renderbuffers(env, settings.scale, old_scale);
++        log!("Display settings were not applied: {}", error);
++        env.on_parent_stack_in_coroutine(move |window, _| {
++            let _ = choose(
++                window.sdl_window(),
++                "Display Settings",
++                &format!("Settings were not applied: {}", error),
++                &["OK"],
++            );
++        });
++        return;
++    }
++    if old_scale != settings.scale {
++        crate::frameworks::core_animation::invalidate_display_target(env);
++    }
++    log!("Applied display preferences live: {:?}", settings);
++    if let Err(error) = save(settings) {
++        log!("Display settings applied but not saved: {}", error);
++        env.on_parent_stack_in_coroutine(move |window, _| {
++            let _ = choose(
++                window.sdl_window(),
++                "Display Settings",
++                &format!("Settings applied, but could not be saved: {}", error),
++                &["OK"],
++            );
++        });
++    }
++}
++
++/// Fit the 3:2 game image inside an output rectangle without stretching.
++pub fn fit((w, h): (u32, u32), (aw, ah): (u32, u32)) -> (u32, u32, u32, u32) {
++    let scale = (w as f64 / aw as f64).min(h as f64 / ah as f64);
++    let fw = (aw as f64 * scale).round() as u32;
++    let fh = (ah as f64 * scale).round() as u32;
++    ((w - fw) / 2, (h - fh) / 2, fw, fh)
++}
++#[cfg(test)]
++mod tests {
++    use super::*;
++    #[test]
++    fn preferences_roundtrip_and_reject_invalid_values() {
++        for resolution in 0..RESOLUTIONS.len() {
++            for scale in 1..=4 {
++                for fullscreen in [false, true] {
++                    let settings = Settings {
++                        resolution,
++                        scale,
++                        fullscreen,
++                    };
++                    assert_eq!(Settings::decode(&settings.encode()), Some(settings));
++                }
++            }
++        }
++        for bad in [
++            "",
++            "version=2\nresolution=0\nfullscreen=0\nscale=1\n",
++            "version=1\nresolution=6\nfullscreen=0\nscale=1\n",
++            "version=1\nresolution=0\nfullscreen=2\nscale=1\n",
++            "version=1\nresolution=0\nfullscreen=0\nscale=0\n",
++            "version=1\nresolution=0\nfullscreen=0\nscale=5\n",
++            "version=1\nresolution=0\nfullscreen=0\nscale=1\nextra",
++        ] {
++            assert_eq!(Settings::decode(bad), None);
++        }
++    }
++    #[test]
++    fn menu_uses_live_settings_even_when_saved_preferences_are_older() {
++        let saved = Settings::default();
++        let active = Settings {
++            resolution: 2,
++            fullscreen: true,
++            scale: 3,
++        };
++        let mut options = crate::options::Options::default();
++        saved.apply(&mut options);
++        active.apply(&mut options); // Successful live apply; disk write may fail.
++        assert_eq!(Settings::from_options(&options), active);
++        // Editing only the window mode must preserve resolution and quality.
++        let mut pending = Settings::from_options(&options);
++        pending.fullscreen = false;
++        assert_eq!(
++            pending,
++            Settings {
++                fullscreen: false,
++                ..active
++            }
++        );
++        assert_ne!(pending.resolution, saved.resolution);
++    }
++
++    #[test]
++    fn popular_outputs_preserve_game_geometry() {
++        assert_eq!(fit((1920, 1080), (480, 320)), (150, 0, 1620, 1080));
++        assert_eq!(fit((960, 640), (480, 320)), (0, 0, 960, 640));
++        assert_eq!(fit((1280, 720), (480, 320)), (100, 0, 1080, 720));
++        assert_eq!(fit((3840, 2160), (480, 320)), (300, 0, 3240, 2160));
++    }
++}
+diff --git a/src/frameworks/uikit/rebellion_scroll.rs b/src/frameworks/uikit/rebellion_scroll.rs
+new file mode 100644
+--- /dev/null
++++ b/src/frameworks/uikit/rebellion_scroll.rs
+@@ -0,0 +1,118 @@
++/*
++ * This Source Code Form is subject to the terms of the Mozilla Public
++ * License, v. 2.0. If a copy of the MPL was not distributed with this
++ * file, You can obtain one at https://mozilla.org/MPL/2.0/.
++ */
++//! Mouse-wheel support for the game's OpenGL Scrolltable lists.
++use crate::frameworks::core_graphics::{CGPoint, CGRect};
++use crate::mem::Ptr;
++use crate::objc::id;
++use crate::{msg, Environment};
++
++#[derive(Default)]
++pub(super) struct State {
++    drawing: Vec<(id, CGRect)>,
++    visible: Vec<(id, CGRect)>,
++}
++
++fn supported(env: &Environment) -> bool {
++    env.bundle.bundle_identifier() == "com.alife.linkinpark"
++        && env.bundle.bundle_version() == "1.4.5"
++}
++
++/// Called only for Scrolltable's guest drawWithOffsetX:OffsetY: method.
++/// Record draw order so hidden lists and lists behind other lists are skipped.
++pub(crate) fn record_draw(env: &mut Environment, table: id) {
++    if !supported(env) {
++        return;
++    }
++    let mut rect: CGRect = env.mem.read((table.cast::<u8>() + 20).cast());
++    rect.origin.x += f32::from_bits(env.cpu.regs()[2]);
++    rect.origin.y += f32::from_bits(env.cpu.regs()[3]);
++    let state = &mut env.framework_state.uikit.rebellion_scroll;
++    state.drawing.push((table, rect));
++}
++
++pub(crate) fn present(env: &mut Environment) {
++    if !supported(env) {
++        return;
++    }
++    let state = &mut env.framework_state.uikit.rebellion_scroll;
++    std::mem::swap(&mut state.visible, &mut state.drawing);
++    state.drawing.clear();
++}
++
++fn offset_after_wheel(current: f32, minimum: f32, delta: f32) -> Option<f32> {
++    if !current.is_finite() || !minimum.is_finite() || !delta.is_finite() || minimum >= 0.0 {
++        return None;
++    }
++    Some((current + delta).clamp(minimum, 0.0))
++}
++
++pub(super) fn scroll(env: &mut Environment, cursor: CGPoint, delta: f32) {
++    if !supported(env) {
++        return;
++    }
++    let visible = env.framework_state.uikit.rebellion_scroll.visible.clone();
++    for (table, rect) in visible.into_iter().rev() {
++        if cursor.x < rect.origin.x
++            || cursor.y < rect.origin.y
++            || cursor.x >= rect.origin.x + rect.size.width
++            || cursor.y >= rect.origin.y + rect.size.height
++        {
++            continue;
++        }
++        if env.objc.get_host_object(table).is_none()
++            || env
++                .objc
++                .get_class_name(crate::objc::ObjC::read_isa(table, &env.mem))
++                != "Scrolltable"
++        {
++            continue;
++        }
++        // IPA 1.4.5 metadata: m_pluggin at 12. The plugin's cycle and
++        // moveToBottom methods establish offset=40, lower bound=48,
++        // velocity=52, scripted-motion flag=9, scroll-enabled=80.
++        let plugin: u32 = env.mem.read((table.cast::<u8>() + 12).cast());
++        if plugin == 0
++            || env
++                .mem
++                .get_bytes_fallible(Ptr::from_bits(plugin), 81)
++                .is_none()
++        {
++            return;
++        }
++        let enabled: u8 = env.mem.read(Ptr::<u8, false>::from_bits(plugin + 80));
++        if enabled == 0 {
++            return;
++        }
++        let current: f32 = msg![env; table getOffsetY];
++        let minimum: f32 = env.mem.read(Ptr::<f32, false>::from_bits(plugin + 48));
++        if let Some(next) = offset_after_wheel(current, minimum, delta) {
++            env.mem.write(Ptr::from_bits(plugin + 52), 0.0f32);
++            env.mem.write(Ptr::from_bits(plugin + 9), 0u8);
++            let _: () = msg![env; table setOffsetY:next];
++            log!(
++                "8-Bit Rebellion wheel scroll: {:?} {} -> {} (minimum {})",
++                table,
++                current,
++                next,
++                minimum
++            );
++        }
++        return; // Only the last drawn list under the cursor receives input.
++    }
++}
++
++#[cfg(test)]
++mod tests {
++    use super::offset_after_wheel;
++    #[test]
++    fn wheel_scroll_preserves_fractional_motion_and_clamps_both_edges() {
++        assert_eq!(offset_after_wheel(-40.0, -100.0, -0.5), Some(-40.5));
++        assert_eq!(offset_after_wheel(-40.0, -100.0, -200.0), Some(-100.0));
++        assert_eq!(offset_after_wheel(-40.0, -100.0, 200.0), Some(0.0));
++        assert_eq!(offset_after_wheel(0.0, 0.0, -40.0), None);
++        assert_eq!(offset_after_wheel(f32::NAN, -100.0, -40.0), None);
++    }
++}
+diff --git a/src/frameworks/uikit/rebellion_test_tools.rs b/src/frameworks/uikit/rebellion_test_tools.rs
+new file mode 100644
+--- /dev/null
++++ b/src/frameworks/uikit/rebellion_test_tools.rs
+@@ -0,0 +1,242 @@
++/*
++ * This Source Code Form is subject to the terms of the Mozilla Public
++ * License, v. 2.0. If a copy of the MPL was not distributed with this
++ * file, You can obtain one at https://mozilla.org/MPL/2.0/.
++ */
++//! Explicitly compiled-in local test tools for the inspected iPhone 1.4.5.
++use crate::mem::{ConstPtr, Ptr};
++use crate::objc::{id, nil};
++use crate::{msg, msg_class, Environment};
++
++#[derive(Default)]
++pub(super) struct State {
++    coins: Option<i32>,
++    posters: Option<(&'static str, Vec<i32>, i32)>,
++    next_achievement: i32,
++}
++
++fn instances(env: &Environment, name: &str) -> Vec<id> {
++    env.objc
++        .all_classes()
++        .find(|(n, _)| n.as_str() == name)
++        .map(|(_, &class)| env.objc.instances_of_class(class, &env.mem))
++        .unwrap_or_default()
++}
++
++pub(super) fn apply(env: &mut Environment, action: u8) {
++    if env.bundle.bundle_identifier() != "com.alife.linkinpark"
++        || env.bundle.bundle_version() != "1.4.5"
++        || std::env::var_os("BEBELLION_TEST_DATA_DIR").is_none()
++    {
++        log!("Test tools require iPhone 1.4.5 and an isolated test data directory");
++        return;
++    }
++    let monitors = instances(env, "PlayerMonitorComponent");
++    let [monitor] = monitors.as_slice() else {
++        log!("Test tools: enter the playable world first");
++        return;
++    };
++    let monitor = *monitor;
++    let account: id = msg_class![env; AccountHandler getHandler];
++    let online: bool = msg![env; account isOnlineMode];
++    if online {
++        log!("Test tools are restricted to the offline campaign");
++        return;
++    }
++    let pool: id = msg_class![env; NSAutoreleasePool new];
++    match action {
++        1 => coins(env, monitor),
++        2 => posters(env),
++        3 => achievement(env, monitor),
++        _ => (),
++    }
++    crate::objc::release(env, pool);
++}
++
++fn coins(env: &mut Environment, monitor: id) {
++    let connector: id = msg_class![env; PlayerConnector getConnector];
++    let profile: id = msg![env; connector getSelfProfile];
++    if profile == nil {
++        return;
++    }
++    let current: i32 = msg![env; profile credits];
++    let original = env.framework_state.uikit.rebellion_test_tools.coins;
++    let target = original.unwrap_or(9999);
++    if original.is_none() {
++        env.framework_state.uikit.rebellion_test_tools.coins = Some(current);
++    }
++    // Use the same absolute update and profile refresh as addCurrency:.
++    let _: () = msg![env; connector playerCreditUpdate:target];
++    let profile: id = msg![env; connector getSelfProfile];
++    let _: () = msg![env; monitor setWithPlayerProfile:profile];
++    for ui in instances(env, "SceneUIComponent") {
++        let _: () = msg![env; ui updateCoin];
++    }
++    let actual: i32 = msg![env; profile credits];
++    if actual == target && original.is_some() {
++        env.framework_state.uikit.rebellion_test_tools.coins = None;
++    }
++    log!(
++        "Test coins: {} -> {} (requested {}; undo baseline {:?})",
++        current,
++        actual,
++        target,
++        env.framework_state.uikit.rebellion_test_tools.coins
++    );
++}
++
++fn posters(env: &mut Environment) {
++    let snapshot = env
++        .framework_state
++        .uikit
++        .rebellion_test_tools
++        .posters
++        .clone();
++    let mut active = None;
++    for (name, required_state) in [("LPMission1", 7), ("LPMission5", 1)] {
++        if snapshot
++            .as_ref()
++            .is_some_and(|(saved_name, _, _)| *saved_name != name)
++        {
++            continue;
++        }
++        let missions = instances(env, name);
++        if let [mission] = missions.as_slice() {
++            let mission = *mission;
++            let quest: id = msg![env; mission mission];
++            let state: i32 = msg![env; quest missionState];
++            if snapshot.is_some() || state == required_state {
++                active = Some((name, mission, state));
++                break;
++            }
++        }
++    }
++    let Some((name, mission, state)) = active else {
++        log!("Test posters: enter an active poster quest (Mission 1 state 7 or Mission 5 state 1)");
++        return;
++    };
++    let Some(current) = super::rebellion_progress::poster_ids(env, mission) else {
++        return;
++    };
++
++    if let Some((_, ids, old_state)) = env
++        .framework_state
++        .uikit
++        .rebellion_test_tools
++        .posters
++        .clone()
++    {
++        // The vector still owns its allocation. Shrink/copy elements without
++        // replacing its storage or bypassing the guest allocator.
++        let field = env
++            .objc
++            .object_lookup_ivar(&env.mem, mission, &"defacedPosterList".to_owned())
++            .unwrap();
++        let vector: u32 = env.mem.read(field);
++        let begin: u32 = env.mem.read(ConstPtr::from_bits(vector));
++        let capacity: u32 = env.mem.read(ConstPtr::from_bits(vector + 8));
++        if capacity < begin || capacity - begin < ids.len() as u32 * 4 {
++            return;
++        }
++        if name == "LPMission1" {
++            let path = env
++                .fs
++                .home_directory()
++                .join("Documents/8beet-poster-progress-v1");
++            if !super::rebellion_progress::write_atomically(
++                &mut env.fs,
++                &path,
++                &super::rebellion_progress::encode(&ids),
++            ) {
++                return;
++            }
++        }
++        for (i, value) in ids.iter().enumerate() {
++            env.mem.write(Ptr::from_bits(begin + i as u32 * 4), *value);
++        }
++        env.mem
++            .write(Ptr::from_bits(vector + 4), begin + ids.len() as u32 * 4);
++        if name == "LPMission1" {
++            env.framework_state.uikit.rebellion_posters = Some(
++                super::rebellion_progress::PosterProgress::saved(mission.to_bits(), ids.clone()),
++            );
++        }
++        let _: () = msg![env; mission setMissionState:old_state];
++        refresh_poster_objective(env, name);
++        env.framework_state.uikit.rebellion_test_tools.posters = None;
++        log!(
++            "Test posters: restored {} IDs and quest state {}. Change district to refresh artwork.",
++            ids.len(),
++            old_state
++        );
++    } else {
++        env.framework_state.uikit.rebellion_test_tools.posters = Some((name, current, state));
++        // Constructor IDs and active quest states inspected in IPA 1.4.5.
++        let range = if name == "LPMission1" {
++            0i32..24
++        } else {
++            24i32..44
++        };
++        for poster in range {
++            let _: () = msg![env; mission defacePoster:poster];
++        }
++        if name == "LPMission1" {
++            super::rebellion_progress::sync_posters(env);
++        }
++        let count: i32 = msg![env; mission defacedPosterCount];
++        log!(
++            "Test posters: {} collected {}. Use the same menu action to undo.",
++            name,
++            count
++        );
++    }
++}
++
++fn refresh_poster_objective(env: &mut Environment, name: &str) {
++    for component in instances(env, "MissionProgressComponent") {
++        if name == "LPMission1" {
++            let _: () = msg![env; component updateMission1Objective];
++        } else {
++            let _: () = msg![env; component updateMission5Objective];
++        }
++    }
++}
++
++fn achievement(env: &mut Environment, monitor: id) {
++    let index = env
++        .framework_state
++        .uikit
++        .rebellion_test_tools
++        .next_achievement;
++    if index >= 16 {
++        log!("Test achievements: all 16 IDs visited; restart test session to repeat");
++        return;
++    }
++    let achievement_id = 22000 + index;
++    let existed: bool = msg![env; monitor isAchievementExistWithAchievementID:achievement_id];
++    log!(
++        "Test achievement {}: beginning normal activation, already present={}",
++        achievement_id,
++        existed
++    );
++    if !existed {
++        // Public game method applies thresholds and normal popup/persistence.
++        // One achievement per action keeps any crash attributable to one ID.
++        let _: () =
++            msg![env; monitor addAchievementWithID:achievement_id WithCurrentNumber:10000i32];
++    }
++    let activated: bool = msg![env; monitor isAchievementExistWithAchievementID:achievement_id];
++    log!(
++        "Test achievement {}: activation returned, active={}",
++        achievement_id,
++        activated
++    );
++    if activated {
++        env.framework_state
++            .uikit
++            .rebellion_test_tools
++            .next_achievement += 1;
++    } else {
++        log!("Close game dialogs and retry this achievement");
++    }
++}

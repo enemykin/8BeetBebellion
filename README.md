@@ -16,9 +16,9 @@ Confirmed by manual testing:
 - Keyboard movement and attack work, including reversing direction during an attack.
 - Double clicks in the center no longer unexpectedly open the menu or Profile.
 
-The early LP splash has been fixed and checked through the title screen. A fix for double clicking The West Side on the map has passed a scripted game check; a user retest of that final fix is still pending.
+The early LP splash has been fixed and checked through the title screen. The latest fix for double clicking The West Side discards touch releases aimed at a view removed during the transition. Both close-click and held-release scripted checks passed, and the user confirmed the crash is fixed on 2026-10-02.
 
-**Still unverified:** full campaign completion, purchases and their persistence, home decoration, multiplayer, and full audio/video synchronization. Mouse-wheel scrolling for long menus is planned.
+**Still unverified:** full campaign completion, purchases and their persistence, home decoration, multiplayer, and full audio/video synchronization.
 
 The local **iPad version 1.4.8 cannot run**: both ARM slices have `cryptid=1`, and touchHLE rejects the encrypted executable. Its declared iOS 6.0 requirement is also newer than touchHLE's supported app range. A decrypted, user-owned copy is needed before further compatibility testing.
 
@@ -80,9 +80,23 @@ Cutscenes play **inside the touchHLE window**: `ffmpeg` decodes video, and `ffpl
 | Space | Attack |
 | W or Up | Enter the available door when its action icon is visible |
 | Escape | Open / close the side menu |
+| F9 | Open Display Settings (ordinary and test builds) |
 | Mouse / touch | Normal game interaction; click to skip a cutscene |
+| Mouse wheel / two-finger trackpad scroll | Scroll the visible long list under the pointer |
+
+On macOS, scrolling reads the Natural scrolling preference at startup. Restart the game after changing that system setting.
 
 Letter keys use physical key positions, including under English and Russian layouts. Door activation follows the game's own command and does not depend on mouse position. Game-specific commands and save compatibility fixes are restricted to the inspected 1.4.5 bundle.
+
+## Display settings
+
+Press **F9** to choose output size (480×320 Original, 960×640, HD, Full HD, QHD or 4K), windowed/fullscreen mode, and internal render scale (1×–4×). **Apply** updates the current game immediately and saves the selection for future launches. **Cancel** discards pending edits, including Reset to defaults. The original game proportions remain 3:2, with borders inside wider output. Higher render scales do not add detail to source sprites.
+
+Windowed presets size the SDL output surface; macOS can scale the window for Retina display. Fullscreen uses the desktop mode with the selected output centered, shrinking it to fit if needed. The configuration is `8beet-display-settings-v1` in touchHLE's user data directory (normally `vendor/touchHLE` for the local launcher). Display preferences are shared by the normal and test launchers; offline game saves remain isolated in test sessions. Changing output size, window mode or render scale does not restart the game.
+
+## Local test menu
+
+For reversible purchase, poster and achievement tests, use the separate feature-gated test build and **Test Bebellion.command**. Press F8 in the playable world. The user confirmed that the menu works on 2026-10-02. Each launch uses an isolated copy of offline saves; restarting discards test changes. Ordinary builds contain no test menu. See [test tool instructions](docs/TEST_TOOLS.md).
 
 ## Repository layout
 
