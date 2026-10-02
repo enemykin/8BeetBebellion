@@ -2,6 +2,8 @@
 
 A compatibility project for running **Linkin Park 8-Bit Rebellion!** on modern computers using a patched [touchHLE](https://github.com/touchHLE/touchHLE).
 
+The original game combines missions against PixxelKorp, character and apartment customization, and Linkin Park music. Completing the campaign unlocks **Blackbirds**. See [Linkinpedia](https://linkinpedia.com/wiki/8-Bit_Rebellion!).
+
 The project contains tools, documentation and a reproducible source patch. **No game IPA, artwork, music, extracted assets, saves or game binaries are distributed.** You must supply your own decrypted copy of the game.
 
 ## Current status
@@ -20,150 +22,48 @@ The early LP splash has been fixed and checked through the title screen. The lat
 
 **Still unverified:** full campaign completion, purchases and their persistence, home decoration, multiplayer, and full audio/video synchronization.
 
-The local **iPad version 1.4.8 cannot run**: both ARM slices have `cryptid=1`, and touchHLE rejects the encrypted executable. Its declared iOS 6.0 requirement is also newer than touchHLE's supported app range. A decrypted, user-owned copy is needed before further compatibility testing.
-
 See [CHANGELOG](CHANGELOG.md), the detailed [compatibility log](docs/COMPATIBILITY_LOG.md), [save/API audit](docs/SAVE_AND_API_AUDIT.md), and [roadmap](docs/ROADMAP.md). Referenced runtime logs are local evidence and are not included in this repository. README, CHANGELOG and the compatibility log are maintained in English.
-
-## Prebuilt releases
-
-A self-contained Apple Silicon package is planned so players can add only their own decrypted IPA. It needs portable video tools, bundled emulator resources, matching source/licenses, and release validation. No such binary package has been published yet. See [the release preparation guide](docs/RELEASING.md). The steps below build from source.
 
 ## Set up on a new Mac
 
-GitHub contains the project tools and source patch. Build touchHLE locally before the first launch. These steps describe the tested Apple Silicon macOS setup; this project's game changes have not been verified on Intel Macs or Windows. On Apple Silicon, use a native Terminal session when building.
+**Release status:** the self-contained Apple Silicon package is planned, but has not been built, validated or published yet. The steps below describe the intended release package. To run the game today, follow [the macOS source build instructions](docs/BUILDING.md). The packaging plan is documented in [the release preparation guide](docs/RELEASING.md).
 
-Run the commands below in **Terminal**, in order. Internet access is needed to download the source and build dependencies. The game itself must come from your own decrypted copy.
+The release will target **Apple Silicon Macs (M1 and newer)**. Its release notes will specify the tested macOS versions and signing/notarization status. You will need only the unpacked package and your own **decrypted iPhone version 1.4.5 IPA**, bundle ID `com.alife.linkinpark`.
 
-### 1. Install the build tools
+### 1. Download and unpack the release
 
-Install Apple's Command Line Tools, which provide the C/C++ compilers:
+Once available, download the **macOS arm64 release ZIP** from [GitHub Releases](https://github.com/enemykin/8BeetBebellion/releases) and unpack it in a writable folder. GitHub's **Code → Download ZIP** and the automatic **Source code** archives contain source files and require the build steps linked above.
 
-```bash
-xcode-select --install
+Keep the unpacked folder together. The planned layout includes:
+
+```text
+8BeetBebellion-macos-arm64/
+  8-Bit Rebellion!.app
+  input/
+  reports/
+  runtime/
+  licenses/
+  README.txt
+  BUILD-MANIFEST.json
 ```
 
-Complete the installation dialog before continuing. If the tools are already installed, skip this step.
+The application will include the patched touchHLE emulator, its resources, and FFmpeg/ffplay with their required libraries. Players will not need to install Python, Git, Rust/Cargo, CMake, Boost or Homebrew, or compile anything. Cutscene video and audio tools will be included in the package.
 
-Install [Homebrew](https://brew.sh/) if `brew --version` does not work. Its official installation command is:
+### 2. Add your IPA
 
-```bash
-/bin/bash -c "$(curl -fsSL https://raw.githubusercontent.com/Homebrew/install/HEAD/install.sh)"
-```
-
-Follow the installer's **Next steps** to add Homebrew to your shell's PATH, then open a new Terminal window. See the [Homebrew installation guide](https://docs.brew.sh/Installation).
-
-Install Python 3.10 or newer, Git, CMake, Boost and FFmpeg:
-
-```bash
-brew install python git cmake boost ffmpeg
-```
-
-Boost is required by touchHLE's CPU emulator. FFmpeg supplies `ffmpeg` for video and `ffplay` for cutscene audio. SDL2 and OpenAL Soft are built through touchHLE's default bundled/static configuration. The pinned upstream build requirements are documented in [touchHLE's build guide](https://github.com/touchHLE/touchHLE/blob/b432f552d8a754c0274da5156f030ca3ac4d0218/dev-docs/building.md).
-
-Install Rust and Cargo through the [official rustup installer](https://rust-lang.org/tools/install/). Select the default stable toolchain:
-
-```bash
-curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh
-source "$HOME/.cargo/env"
-```
-
-Check that the tools are available:
-
-```bash
-python3 --version
-git --version
-rustc --version
-cargo --version
-cmake --version
-command -v ffmpeg ffplay
-```
-
-### 2. Download the project
-
-Choose a working directory, then clone the repository:
-
-```bash
-mkdir -p "$HOME/Developer"
-cd "$HOME/Developer"
-git clone https://github.com/enemykin/8BeetBebellion.git
-cd 8BeetBebellion
-mkdir -p input reports
-```
-
-Keep this Terminal in the project directory for the next steps. Alternatively, use GitHub's **Code → Download ZIP**, unpack the archive and open Terminal in the unpacked project directory. The project commands are the same after that point.
-
-### 3. Fetch, patch and build touchHLE
-
-Download the exact upstream revision specified in [config/touchhle.json](config/touchhle.json), initialize its source submodules, and check the compatibility patch before applying it:
-
-```bash
-python3 scripts/bootstrap_touchhle.py
-git -C vendor/touchHLE submodule update --init --recursive
-git -C vendor/touchHLE apply --check ../../patches/touchhle-compatibility.patch
-git -C vendor/touchHLE apply ../../patches/touchhle-compatibility.patch
-```
-
-Apply the patch **once to a clean checkout**. If the check fails, stop and inspect the error; do not apply it again to an already patched checkout. Do not update upstream to a different revision without checking compatibility.
-
-Build the normal release binary and return to the project root:
-
-```bash
-cd vendor/touchHLE
-CMAKE_POLICY_VERSION_MINIMUM=3.5 cargo build --release --locked
-cd ../..
-```
-
-The first build downloads Cargo dependencies and compiles native libraries, so allow it to finish. `CMAKE_POLICY_VERSION_MINIMUM=3.5` keeps the pinned native dependencies compatible with newer CMake releases. A successful build creates `vendor/touchHLE/target/release/touchHLE`. Keep the upstream checkout in place: its bundled fonts, dynamic libraries and default options are needed at runtime.
-
-### 4. Add your IPA and check it
-
-In Finder, place your own **decrypted iPhone version 1.4.5** IPA in the project's `input/` directory, using the filename:
+Place your own decrypted IPA in the unpacked package's `input/` folder and name it:
 
 ```text
 8Bit Rebellion v1.4.5.ipa
 ```
 
-The tested bundle identifier is `com.alife.linkinpark`. The encrypted iPad 1.4.8 copy is not a supported substitute. The repository does not provide or download game binaries.
+Use the currently supported **iPhone version 1.4.5**. Support for the iPad edition is planned in [the roadmap](docs/ROADMAP.md). The release will not contain or download the game, its music or its artwork.
 
-From the project root, inspect the IPA and run the project tool tests:
+### 3. Start the game
 
-```bash
-python3 scripts/inspect_ipa.py 'input/8Bit Rebellion v1.4.5.ipa' --output reports/ipa-report.json
-python3 -m unittest discover -s tests -v
-```
+Double click **8-Bit Rebellion!.app** in the unpacked folder. No Terminal commands or dependency installation will be needed for the intended release package.
 
-The report should identify the expected bundle/version and show `appears_decrypted: true` in its `macho` section. This is an encryption-header check; it does not guarantee that a damaged or otherwise incompatible IPA will run. If the report shows `false`, the executable is encrypted and cannot be used with this setup.
-
-### 5. Launch the game
-
-From Finder, double click **Start Bebellion.command**, or run this from the project root:
-
-```bash
-./'Start Bebellion.command'
-```
-
-If a ZIP download lost the launcher's executable permission, restore it and run again:
-
-```bash
-chmod +x 'Start Bebellion.command'
-./'Start Bebellion.command'
-```
-
-The launcher uses `input/8Bit Rebellion v1.4.5.ipa` by default. To select a differently named local IPA without renaming it:
-
-```bash
-BEBELLION_IPA='/absolute/path/to/your.ipa' ./'Start Bebellion.command'
-```
-
-Normal launches enable sound. Every run creates an ignored `reports/manual-run-*.log` with output, timestamps and the exit code. If startup fails, read that log. Common setup problems are a missing IPA, a missing release binary, an unapplied patch, missing upstream submodules, or tools not available on PATH. If cutscenes fail, check that both `ffmpeg` and `ffplay` are available.
-
-Normal guest saves are stored under `vendor/touchHLE/touchHLE_sandbox/com.alife.linkinpark/`. A new Mac starts a new campaign unless you transfer your existing offline saves. Downloading the project does not transfer game progress or display preferences.
-
-For the same isolated sessions used in testing, also build the separate feature-enabled binary and follow [the test launcher instructions](docs/TEST_TOOLS.md). Launch it with **Test Bebellion.command**; restarting that launcher starts from a fresh copy of the normal local campaign saves. The ordinary release binary has no cheat menu.
-
-The normal launcher enables `--landscape-content-layout`, keyboard controls, and the optional `--tolerate-nil-dictionary-keys` compatibility mode for the offline path. The latter deliberately skips malformed dictionary insertions and is not standard Foundation behavior.
-
-Cutscenes play **inside the touchHLE window**: `ffmpeg` decodes video, and `ffplay` handles sound without a separate window. Both receive game data directly from the local IPA. Clicking the screen skips the active cutscene. If the required tools are missing, playback may be skipped; the log records the reason.
+The launcher will read the IPA from `input/`, write startup logs to `reports/`, and keep saves and display preferences in `runtime/`, outside the application bundle. Keep these folders with the application when moving the package. A fresh package on another Mac starts a new campaign unless you transfer your existing offline saves.
 
 ### Controls
 
@@ -187,10 +87,6 @@ Press **F9** to choose output size (480×320 Original, 960×640, HD, Full HD, QH
 
 Windowed presets size the SDL output surface; macOS can scale the window for Retina display. Fullscreen uses the desktop mode with the selected output centered, shrinking it to fit if needed. The configuration is `8beet-display-settings-v1` in touchHLE's user data directory (normally `vendor/touchHLE` for the local launcher). Display preferences are shared by the normal and test launchers; offline game saves remain isolated in test sessions. Changing output size, window mode or render scale does not restart the game.
 
-## Local test menu
-
-For reversible purchase, poster and achievement tests, use the separate feature-gated test build and **Test Bebellion.command**. Press F8 in the playable world. The user confirmed that the menu works on 2026-10-02. Each launch uses an isolated copy of offline saves; restarting discards test changes. Ordinary builds contain no test menu. See [test tool instructions](docs/TEST_TOOLS.md).
-
 ## Repository layout
 
 ```text
@@ -208,6 +104,8 @@ Start Bebellion.command             macOS launcher
 
 ## Scope and third-party code
 
-The first priority is compatibility with the original application. A remake would require a separate decision after investigating the limits of emulation. Network compatibility currently supports continued offline execution; it does not implement multiplayer or provide access to accounts or services.
+This project runs a user-owned, decrypted copy of the original game through a patched touchHLE emulator. The supported goal is the offline single-player campaign; multiplayer and access to online accounts or services are not implemented. The game and its content belong to their respective rights holders and are supplied separately by the player.
 
-The patch retains touchHLE's license notices. See [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md). This project does not distribute the game or claim ownership of its content.
+The planned Apple Silicon release will bundle touchHLE, its support libraries and fonts, and FFmpeg/ffplay for cutscenes. These components retain their own licenses and upstream attribution. touchHLE source is licensed under MPL-2.0; upstream distributes its binaries under GPL-3.0-or-later because of dependency license compatibility. FFmpeg's applicable license depends on the exact build configuration.
+
+Binary releases will include applicable license texts and notices in `licenses/`, plus a separate matching source archive with dependency sources, patches and build instructions. The repository's automatic source ZIP is not a substitute for that archive. See [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md) for component attribution and [the release preparation guide](docs/RELEASING.md) for packaging requirements. No self-contained binary release has been published yet.

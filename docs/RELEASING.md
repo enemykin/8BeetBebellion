@@ -8,7 +8,7 @@ This document defines the packaging procedure. **A self-contained release has no
 
 ## Selected design
 
-Use statically linked FFmpeg libraries and statically linked SDL2 for ffplay. Ship a native **Start Bebellion.app** in a ZIP for Apple Silicon. The player unpacks the ZIP, places their decrypted IPA in the adjacent input directory, and opens the application. All non-system runtime dependencies are supplied by the package; only macOS frameworks/libraries remain external. Developer ID signing and notarization are part of the intended ordinary first-launch experience.
+Use statically linked FFmpeg libraries and statically linked SDL2 for ffplay. Ship a native **8-Bit Rebellion!.app** in a ZIP for Apple Silicon. The player unpacks the ZIP, places their decrypted IPA in the adjacent input directory, and opens the application. All non-system runtime dependencies are supplied by the package; only macOS frameworks/libraries remain external. Developer ID signing and notarization are part of the intended ordinary first-launch experience.
 
 This is the selected packaging design, not a claim that the finished application has already been built or tested.
 
@@ -18,7 +18,7 @@ Use an explicit allowlist when assembling a new, empty staging directory under t
 
 ```text
 8BeetBebellion-macos-arm64/
-  Start Bebellion.app/
+  8-Bit Rebellion!.app/
     Contents/
       Info.plist
       MacOS/
@@ -44,7 +44,7 @@ The production package uses only the ordinary binary. A separately named test pa
 
 ## Build the emulator
 
-Follow the source setup in the main README, including the pinned touchHLE revision, submodule initialization and compatibility patch. Build on a native Apple Silicon Mac:
+Follow [the macOS source setup](BUILDING.md), including the pinned touchHLE revision, submodule initialization and compatibility patch. Build on a native Apple Silicon Mac:
 
 ```bash
 cd vendor/touchHLE
@@ -98,4 +98,4 @@ After these checks, create these assets:
 
 Create a **GitHub Release** for a version tag pointing to the validated commit, and upload the assets to that release. GitHub's automatically generated Source code ZIP is not the prebuilt game launcher. A draft release can hold artifacts while verification is pending; publish it only when the notes accurately describe its state. Keep large generated binaries out of ordinary Git commits.
 
-GitHub releases are created through the owner's authenticated account. For new project commits use author/committer enemykin with the verified GitHub noreply address `316342448+enemykin@users.noreply.github.com`. Signing/notarization identities and upstream copyright notices are independent of Git commit authorship. Earlier published history is not rewritten by this configuration.
+GitHub releases are created through the owner's authenticated account. For new project commits use author/committer enemykin with the verified GitHub noreply address `316342448+enemykin@users.noreply.github.com`. Signing/notarization identities and upstream copyright notices are independent of Git commit authorship. Historical project commits previously attributed to Codex are corrected to the owner's identity; upstream authorship and copyright notices remain intact.
