@@ -24,6 +24,10 @@ The local **iPad version 1.4.8 cannot run**: both ARM slices have `cryptid=1`, a
 
 See [CHANGELOG](CHANGELOG.md), the detailed [compatibility log](docs/COMPATIBILITY_LOG.md), [save/API audit](docs/SAVE_AND_API_AUDIT.md), and [roadmap](docs/ROADMAP.md). Referenced runtime logs are local evidence and are not included in this repository. README, CHANGELOG and the compatibility log are maintained in English.
 
+## Prebuilt releases
+
+A self-contained Apple Silicon package is planned so players can add only their own decrypted IPA. It needs portable video tools, bundled emulator resources, matching source/licenses, and release validation. No such binary package has been published yet. See [the release preparation guide](docs/RELEASING.md). The steps below build from source.
+
 ## Set up on a new Mac
 
 GitHub contains the project tools and source patch. Build touchHLE locally before the first launch. These steps describe the tested Apple Silicon macOS setup; this project's game changes have not been verified on Intel Macs or Windows. On Apple Silicon, use a native Terminal session when building.
