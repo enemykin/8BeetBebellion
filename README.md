@@ -73,7 +73,7 @@ The launcher reads the IPA from `input/`, writes startup logs to `reports/`, and
 | Space | Attack |
 | W or Up | Enter the available door when its action icon is visible |
 | Escape | Open / close the side menu |
-| F9 | Open Display Settings (ordinary and test builds) |
+| F9 | Open Settings (ordinary and test builds) |
 | Mouse / touch | Normal game interaction; click to skip a cutscene |
 | Mouse wheel / two-finger trackpad scroll | Scroll the visible long list under the pointer |
 
@@ -83,9 +83,11 @@ Keyboard movement and attack follow the game's current **Control: Touch / D-Pad*
 
 ## Display settings
 
-Press **F9** to mute/unmute all game audio or choose output size (480×320 Original, 960×640, HD, Full HD, QHD or 4K), windowed/fullscreen mode, and internal render scale (1×–4×). **Apply** updates the current game immediately and saves the selection for future launches. **Cancel** discards pending edits, including Reset to defaults. The original game proportions remain 3:2, with borders inside wider output. Higher render scales do not add detail to source sprites.
+Press **F9** to open **Settings**. **Video** groups output resolution (480×320 Original, 960×640, HD, Full HD, QHD or 4K), window mode, render quality (1×–4×), and **Smooth scrolling**. **Audio** contains the **Sound** selector (On / Muted). Each row has its name on the left and a dropdown on the right; hover over **ⓘ** beside Resolution, Render quality or Smooth scrolling for an explanation. Rows without additional help have no icon. **Apply** updates the current game immediately and saves both video and audio choices for future launches. **Cancel**, Escape or closing the settings window discards all pending edits. The original game proportions remain 3:2, with borders inside wider output. Higher render scales do not add detail to source sprites. At 2×–4×, magnified game textures use nearest-pixel filtering to prevent atlas seams; this keeps pixel edges sharp and makes illustrated backgrounds more pixelated. The original 1× filtering is preserved.
 
-Windowed presets size the SDL output surface; macOS can scale the window for Retina display. Fullscreen uses the desktop mode with the selected output centered, shrinking it to fit if needed. The configuration is `8beet-display-settings-v1` in touchHLE's user data directory (`runtime/` beside the packaged application; `vendor/touchHLE` for the source launcher). Display preferences are shared by the normal and test launchers; offline game saves remain isolated in test sessions. Changing output size, window mode or render scale does not restart the game. **Mute sound / Unmute sound** takes effect immediately, including music, effects and the current cutscene; it closes the menu and discards pending display edits. The sound choice persists in `8beet-sound-settings-v1` for future launches.
+**Smooth scrolling** adds intermediate frames at a target of 60 Hz only while the camera or player moves in a playable location, interpolating the camera, background layers, the player’s drawn position, door indicators and world bulletin screens between the original 15 Hz game updates. The splash, title, loading screens, menus and idle locations remain at the original 15 Hz. It is off by default; toggle it in F9 and press **Apply**. The game’s logic, movement, combat and animation clocks keep their original update rate. Interpolation adds up to one original tick (about 67 ms) of visual delay. Actual rendering frequency depends on machine load.
+
+Windowed presets size the SDL output surface; macOS can scale the window for Retina display. Fullscreen uses the desktop mode with the selected output centered, shrinking it to fit if needed. The configuration is `8beet-display-settings-v1` in touchHLE's user data directory (`runtime/` beside the packaged application; `vendor/touchHLE` for the source launcher). Display preferences are shared by the normal and test launchers; offline game saves remain isolated in test sessions. Changing output size, window mode or render scale does not restart the game. **Sound** takes effect when you press **Apply**, including music, effects and the current cutscene; **Cancel** preserves the previous sound setting. The sound choice persists in `8beet-sound-settings-v1` for future launches.
 
 ## Repository layout
 

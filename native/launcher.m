@@ -18,7 +18,11 @@ static int fail(NSString *message, BOOL checkOnly, NSURL *input) {
         [NSApplication sharedApplication];
         [NSApp setActivationPolicy:NSApplicationActivationPolicyAccessory];
         [NSApp activateIgnoringOtherApps:YES];
+        NSString *iconPath = [[NSBundle mainBundle] pathForResource:@"AppIcon" ofType:@"icns"];
+        NSImage *icon = iconPath ? [[NSImage alloc] initWithContentsOfFile:iconPath] : nil;
+        if (icon) [NSApp setApplicationIconImage:icon];
         NSAlert *alert = [[NSAlert alloc] init];
+        if (icon) alert.icon = icon;
         alert.messageText = @"8BeetBebellion";
         alert.informativeText = message;
         [alert addButtonWithTitle:@"Close"];

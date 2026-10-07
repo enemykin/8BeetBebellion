@@ -77,7 +77,9 @@ def source_archive(releases, config, manifest):
     tracked_copy(UPSTREAM, staging / "touchHLE")
     # New compatibility modules are intentionally untracked in the local upstream checkout.
     for name in ("src/display_settings.rs", "src/sound_settings.rs", "src/frameworks/uikit/rebellion_scroll.rs",
-                 "src/frameworks/uikit/rebellion_test_tools.rs"):
+                 "src/frameworks/uikit/rebellion_test_tools.rs", "src/frameworks/uikit/rebellion_render.rs",
+                 "src/frameworks/opengles/atlas_guard.rs",
+                 "src/host_settings.h", "src/host_settings_macos.m", "src/host_settings_windows.c"):
         shutil.copy2(UPSTREAM / name, staging / "touchHLE" / name)
     cargo = staging / "cargo"
     cargo_config = run(["cargo", "vendor", "--locked", "--offline", cargo], cwd=UPSTREAM, text=True)
